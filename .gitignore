@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.env
+config.env
+local-only/feishu-bot/feishu_bot.env
+local-only/relogin.env
+release/
+日报草稿/
+日报文档/
+日报质检/
+日报状态/
+*.log
+*.png
+*.zip
+*.sha256

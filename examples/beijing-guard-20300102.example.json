@@ -1,0 +1,22 @@
+{
+  "target_ymd": "20300102",
+  "time_authority": {
+    "mode": "network_quorum",
+    "timezone": "Asia/Shanghai"
+  },
+  "wewe_at_window_close": {
+    "status": "auth_required",
+    "wewe_included": false,
+    "immutable": true,
+    "at_bj": "2030-01-02T15:00:00+08:00"
+  },
+  "stages": {
+    "wewe_check_1330": {"status": "ok", "reminder_required": true},
+    "wewe_check_1430": {"status": "ok", "reminder_required": true},
+    "daily": {"status": "sent", "attempts": 2}
+  },
+  "deadline_alert": {
+    "feishu_verified": true,
+    "dialog_started": true
+  }
+}

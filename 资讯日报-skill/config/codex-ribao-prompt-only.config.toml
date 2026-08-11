@@ -1,0 +1,16 @@
+# Dedicated control-plane config for launchd daily composition.
+# Daily inputs are supplied over stdin; all model filesystem/browser tools are
+# disabled, so Codex never needs direct access to the external volume.
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+[features]
+shell_tool = false
+unified_exec = false
+shell_snapshot = false
+plugins = false
+apps = false
+hooks = false
+browser_use = false
+computer_use = false
+multi_agent = false

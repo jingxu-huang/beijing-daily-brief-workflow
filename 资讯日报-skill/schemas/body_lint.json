@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "title": "body_lint.json — 去 AI 腔 / 来源动作壳 / 兜底话术 共享 lint 规则",
+  "description": "render_report.py --validate-only 与 check_report.py 共用同一份规则，避免规则散落成 SKILL.md 散文 + check_report 正则各写一套。作用对象：decisions.items[] 的 title / paragraphs[] / bullets[].text（source=manual 条目同样适用）。所有 regex 为 Python re 语法，匹配前先按行/整段扫描。hard_fail 命中即 validate 硬失败；soft_warn 命中出 WARN 供人工判断。",
+  "applies_to": ["decisions.items[].title", "decisions.items[].paragraphs[]", "decisions.items[].bullets[].text"],
+
+  "structural_hard_fail_regex": [
+    {"pattern": "(?m)^\\s{0,3}#{1,6}\\s", "reason": "正文出现 Markdown 标题层级；层级由 renderer 生成"},
+    {"pattern": "!\\[[^\\]]*\\]\\(", "reason": "正文出现图片 Markdown；图片走 images 字段 + image_layout"},
+    {"pattern": "</?[A-Za-z][A-Za-z0-9]*(\\s[^>]*)?>", "reason": "正文出现 HTML 标签；<br> 等间距由 renderer 生成"},
+    {"pattern": "https?://", "reason": "正文出现裸 URL；链接只放 links[]，由 renderer 单独成行渲染"}
+  ],
+
+  "source_shell_hard_fail_regex": [
+    {"pattern": "(白鲸出海|点点出海|罗斯基|Z\\s?Potentials|DataEye|智通财经)[^，。；\\n]{0,8}(整理|翻译|编译|梳理|汇总|摘编)", "reason": "命名采集方 + 采集动作壳，如“点点出海将针对…”“以下为罗斯基…翻译整理”"},
+    {"pattern": "(原文|文章|文中|本文|该文)(称|指出|认为|提到|表示|写道|介绍)", "reason": "指代来源文章自身的动作壳，如“原文称/文中认为”"},
+    {"pattern": "(以下为|下文中|下文将|本文将|本篇将|本报|笔者|小编)", "reason": "采集/编辑口吻，非新闻事实"},
+    {"pattern": "(经\\s?WeWe\\s?RSS|经 ?AI ?工具集|本条来自|该条来自|来源为)", "reason": "采集渠道说明；来源统一放 Source 表"}
+  ],
+
+  "filler_hard_fail_substrings": [
+    "待补全文", "以原文为准", "补足观察信号", "暂无更多信息", "信息有限但", "更多细节待补"
+  ],
+
+  "ai_tone_soft_warn_substrings": [
+    "值得一提的是", "总的来说", "综上所述", "不难看出", "由此可见", "众所周知",
+    "在当今", "随着时代", "无疑", "可以说", "堪称", "本文将带你", "一探究竟"
+  ],
+
+  "notes": [
+    "允许保留“注明出处”的合规写法：如“据 36氪 报道”“AppsFlyer 给出的数据为”“分析指出”——这类是规范要求的转述出处，不进 hard_fail；若要收紧改口水，用 soft_warn。",
+    "source_shell 只命中‘指代来源文章/采集方+采集动作’的壳，不误伤‘某公司/某高管+表示/指出’这类正常新闻转述（主语是新闻当事人而非文章本身）。实现时可先剔除当事人主语再匹配。",
+    "structural_hard_fail 与 renderer 的拒绝渲染重叠是有意的：renderer 保证成稿不出这些，check_report 复用同一份规则做发布后抽样断言防回归。",
+    "manual_seed 条目（source=manual）正文同样过全部规则，人工补入不豁免 lint。"
+  ]
+}

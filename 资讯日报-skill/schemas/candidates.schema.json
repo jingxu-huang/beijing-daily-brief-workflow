@@ -1,0 +1,106 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "candidates.schema.json",
+  "title": "candidates-YMD.json — fetch_news.py 产出的候选清单（阶段3契约 v1 冻结）",
+  "description": "fetch_news.py 在生成人读草稿的同时增发本文件，供 codex 结构化决策。冻结原则：schema_version=1 内只做向后兼容的加字段；破坏性变更升 schema_version=2 且双方在 阶段3-协作log.md 确认。board_hint/track_hint 只是脚本猜测，decisions 端才做枚举硬约束。",
+  "type": "object",
+  "required": ["date", "schema_version", "window", "items"],
+  "additionalProperties": true,
+  "properties": {
+    "date": {"type": "string", "pattern": "^\\d{8}$"},
+    "schema_version": {"const": 1},
+    "contract_revision": {"type": "string", "description": "可选，加字段时用 1.1/1.2 标注，便于双方对齐；不改变 schema_version"},
+    "window": {
+      "type": "object",
+      "required": ["start_bj", "end_bj"],
+      "properties": {
+        "start_bj": {"type": "string", "description": "北京时间 YYYY-MM-DD HH:MM，抬头时间范围由此推导"},
+        "end_bj": {"type": "string"}
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "bucket", "title", "url", "source_id", "source_label", "source_type", "summary"],
+        "additionalProperties": true,
+        "properties": {
+          "id": {"type": "string", "pattern": "^c-\\d{3,}$"},
+          "bucket": {
+            "enum": ["featured", "backup", "undated_review", "old_news_review", "manual_seed"],
+            "description": "替代草稿里 ⭐精选/备选/无时间戳复核/旧闻复核 的文本解析；featured 必须在 decisions 里有 adopt/drop"
+          },
+          "board_hint": {"type": "string", "description": "脚本猜的一级板块，codex 可推翻；值宜取自 decisions 的 board 枚举但不强制"},
+          "track_hint": {"type": "string", "description": "脚本猜的二级赛道"},
+          "title": {"type": "string"},
+          "url": {"type": "string"},
+          "canonical_url": {"type": "string"},
+          "published_bj": {"type": "string", "description": "北京时间；undated=true 时可空"},
+          "undated": {"type": "boolean", "default": false},
+          "published_confidence": {
+            "enum": ["exact", "article_page", "feed", "inferred", "unknown"],
+            "description": "时间置信度，避免无时间戳文章被误当当日新闻；listpage 常为 inferred/unknown"
+          },
+          "source_id": {"type": "string", "description": "机器源名，如 baijing / wewe:luosiji / ithome / pocketgamer"},
+          "source_label": {"type": "string", "description": "成稿 Source 表展示名，如 白鲸出海（经 WeWe RSS）"},
+          "source_type": {
+            "enum": ["rss", "raw_rss", "listpage", "wechat", "api", "manual", "web"],
+            "description": "源类型，便于源健康与 Source 表回溯"
+          },
+          "dedup_key": {"type": "string", "description": "稳定去重键：白鲸聚合拆条/同链多短讯/WeWe 单源项都需要，不只靠 URL"},
+          "score": {"type": "number"},
+          "summary": {"type": "string"},
+          "full_text_excerpt": {"type": "string", "description": "正文节选，截断约2000字；长文后段产品/图片以 full_text_ref 为准"},
+          "full_text_ref": {"type": "string", "description": "完整正文相对路径，如 日报状态/fulltext/20260707/c-002.txt；无全文时省略"},
+          "candidate_images": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "url"],
+              "additionalProperties": true,
+              "properties": {
+                "id": {"type": "string", "pattern": "^img-\\d+$", "description": "在该条目内唯一"},
+                "url": {"type": "string"},
+                "context": {"type": "string", "description": "图在原文的位置/语义，如 该产品段落后首图"},
+                "nearby_text": {"type": "string", "description": "图前后截断文本，供判断配哪张"},
+                "role_hint": {
+                  "enum": ["product_screenshot", "data_chart", "cover", "stock", "logo", "qrcode", "unknown"],
+                  "description": "图片角色猜测；cover/stock/logo/qrcode 一般不入选"
+                },
+                "blocked_reason": {"type": "string", "description": "非空表示 fetch 层已判定弃用（如 pexels题图/图库/logo/二维码/微信防盗链），保留供复核但不进入可选图"},
+                "width": {"type": "integer"},
+                "height": {"type": "integer"}
+              }
+            }
+          },
+          "old_news": {
+            "type": "object",
+            "required": ["level"],
+            "properties": {
+              "level": {"enum": ["none", "soft", "hard"]},
+              "matched": {"type": "string", "description": "命中的历史成稿事件，如 20260705 成稿：Shortical 1亿美元融资"}
+            }
+          },
+          "event_features": {
+            "type": "object",
+            "description": "复用旧闻门禁抽取结果，供 decisions 解释采用/剔除、供数字可追溯核验",
+            "properties": {
+              "entities": {"type": "array", "items": {"type": "string"}},
+              "money": {"type": "array", "items": {"type": "string"}},
+              "rounds": {"type": "array", "items": {"type": "string"}},
+              "investors": {"type": "array", "items": {"type": "string"}},
+              "core_numbers": {"type": "array", "items": {"type": "string"}},
+              "event_terms": {"type": "array", "items": {"type": "string"}}
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "抓取层警告，建议取自：stale_source / undated / wechat_title_only / image_hotlink_risk / fulltext_truncated / listpage_no_time"
+          }
+        }
+      }
+    },
+    "source_health": {"type": "object", "description": "阶段4占位：各源抓取成功/条数/连续失败天数"}
+  }
+}

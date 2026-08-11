@@ -1,0 +1,187 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "decisions.schema.json",
+  "title": "decisions-YMD.json — codex 的唯一 compose 产物（阶段3契约 v1 冻结）",
+  "description": "硬性约定：candidates 里每一条 featured 必须在 items 里出现且 action 二选一，漏判即 render_report.py --validate-only 硬失败。正文形态由 renderer 从 paragraphs/bullets 渲染，codex 不再直接写 Markdown。板块标题、赛道图标、序号、<br> 间距、Source 表、链接单独成行全部由 renderer 保证。人工补入并入 items[]（id 用 m-xxx，带 manual_override 块），top-level manual_overrides 仅作索引。去 AI 腔正文 lint 由 schemas/body_lint.json 驱动，renderer 与 check_report 共用。",
+  "type": "object",
+  "required": ["date", "schema_version", "items"],
+  "additionalProperties": true,
+  "definitions": {
+    "board": {"enum": ["泛娱乐·出海", "创新·AI娱乐", "全球融资"]},
+    "track": {
+      "enum": [
+        "休闲游戏", "短剧/漫剧", "小说·网文", "社交·Dating", "其他",
+        "AI模型与应用（娱乐向）", "创新硬件（娱乐向）",
+        "泛娱乐融资", "泛AI·AI应用融资"
+      ]
+    },
+    "bullet": {
+      "type": "object",
+      "required": ["text"],
+      "properties": {
+        "label": {"type": "string", "description": "维度标签，如 产品概况/市场数据/关键数据；模板A建议每条带 label"},
+        "text": {"type": "string", "description": "纯文本，禁标题层级/HTML/图片语法/裸URL，受 body_lint 约束"}
+      }
+    },
+    "image": {
+      "type": "object",
+      "required": ["reason"],
+      "oneOf": [
+        {"required": ["id"]},
+        {"required": ["external_url", "checked_access"]}
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^img-\\d+$", "description": "引用该条 candidate_images 的 id；与 external_url 二选一"},
+        "external_url": {"type": "string", "description": "候选图之外的图（官网/商店截图等）；必须同时 checked_access=true，质检重点核验"},
+        "checked_access": {"type": "boolean", "description": "external_url 必填：已确认可访问且非防盗链"},
+        "caption": {"type": "string", "description": "image_layout=two_column/stacked 时每张必填（renderer 校验）"},
+        "reason": {"type": "string", "description": "选图依据，如 《Clash of Critters》App Store 截图"},
+        "source_context": {"type": "string"}
+      }
+    }
+  },
+  "properties": {
+    "date": {"type": "string", "pattern": "^\\d{8}$"},
+    "schema_version": {"const": 1},
+    "contract_revision": {"type": "string"},
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "action"],
+        "additionalProperties": true,
+        "properties": {
+          "id": {"type": "string", "pattern": "^(c|m)-\\d{2,}$", "description": "candidates 的 c-xxx，或人工补入 m-xxx"},
+          "source": {"enum": ["candidate", "manual"], "description": "缺省 candidate；m-xxx 必须为 manual"},
+          "action": {"enum": ["adopt", "drop"]},
+          "drop_reason": {
+            "enum": [
+              "off_topic", "old_news_hard", "old_news_soft_no_new_progress",
+              "duplicate_same_event", "low_information", "source_stale_or_undated",
+              "misclassified_funding", "event_promo", "commodity_hardware",
+              "not_important_enough", "replaced_by_merge"
+            ],
+            "description": "action=drop 必填，枚举化以便 check_report 不再解析散文"
+          },
+          "drop_note": {"type": "string", "description": "drop 的人话补充，可选"},
+          "adopt_reason": {"type": "string", "description": "建议填，尤其人工提权类：重大融资/核心赛道/大厂AI创作工具"},
+          "board": {"$ref": "#/definitions/board", "description": "action=adopt 必填"},
+          "track": {"$ref": "#/definitions/track", "description": "action=adopt 必填；须与 board 匹配（见 allOf）"},
+          "merged_from": {"type": "array", "items": {"type": "string"}, "description": "同一事件合并进本条的其他候选 id；这些 id 不得再单独 adopt"},
+          "primary_source_label": {"type": "string", "description": "Source 表按此计 1 条；缺省用该条 source_label"},
+          "source_links": {
+            "type": "array",
+            "description": "多源合并时的完整归因；renderer Source 表默认只按 role=primary 计数",
+            "items": {
+              "type": "object",
+              "required": ["url", "source_label", "role"],
+              "properties": {
+                "url": {"type": "string"},
+                "source_label": {"type": "string"},
+                "role": {"enum": ["primary", "secondary"]}
+              }
+            }
+          },
+          "template": {"enum": ["A", "B", "C"], "description": "A=分维度标签(bullets)，B=概述段落，C=融资两段"},
+          "title": {"type": "string", "description": "渲染用裸标题，不含序号/图标；renderer 补 n）与赛道图标"},
+          "paragraphs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "正文段落（纯文本，禁标题/HTML/图片/裸URL，受 body_lint 约束）；A≤1段、B 1-2段、C 严格2段"
+          },
+          "bullets": {
+            "type": "array",
+            "items": {"$ref": "#/definitions/bullet"},
+            "description": "维度要点；A 必有、C 禁用"
+          },
+          "links": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "正文渲染的裸链接，单独成行；至少一条"},
+          "image_layout": {
+            "enum": ["none", "single", "two_column", "stacked"],
+            "description": "配图布局；多产品文章（如 Lilith 三产品）用 stacked，每张必带 caption；two_column 仅用于规范允许的双图例外"
+          },
+          "images": {"type": "array", "items": {"$ref": "#/definitions/image"}},
+          "no_image_reason": {"type": "string", "description": "image_layout=none 且非榜单/产品形态类时建议填"},
+          "old_news_adoption": {
+            "type": "object",
+            "description": "采用 old_news.level=soft/hard 的候选时必填",
+            "required": ["level", "new_progress"],
+            "properties": {
+              "level": {"enum": ["soft", "hard"]},
+              "new_progress": {"type": "string", "description": "本次的实质新进展主事实；空则 validate FAIL"}
+            }
+          },
+          "manual_override": {
+            "type": "object",
+            "description": "source=manual 必填；人工补入/备选池提权的自检记录",
+            "required": ["reason", "checked_time_window", "checked_topic_fit", "checked_not_old_news"],
+            "properties": {
+              "reason": {"type": "string"},
+              "checked_time_window": {"type": "boolean"},
+              "checked_topic_fit": {"type": "boolean"},
+              "checked_not_old_news": {"type": "boolean"}
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"action": {"const": "adopt"}}, "required": ["action"]},
+            "then": {"required": ["board", "track", "template", "title", "paragraphs", "links", "image_layout"]}
+          },
+          {
+            "if": {"properties": {"action": {"const": "drop"}}, "required": ["action"]},
+            "then": {"required": ["drop_reason"]}
+          },
+          {
+            "if": {"properties": {"source": {"const": "manual"}}, "required": ["source"]},
+            "then": {"required": ["url", "source_label", "manual_override"], "properties": {"url": {"type": "string"}, "source_label": {"type": "string"}}}
+          },
+          {
+            "if": {"properties": {"id": {"pattern": "^m-"}}, "required": ["id"]},
+            "then": {"required": ["source"], "properties": {"source": {"const": "manual"}}}
+          },
+          {
+            "if": {"properties": {"board": {"const": "泛娱乐·出海"}}, "required": ["board"]},
+            "then": {"properties": {"track": {"enum": ["休闲游戏", "短剧/漫剧", "小说·网文", "社交·Dating", "其他"]}}}
+          },
+          {
+            "if": {"properties": {"board": {"const": "创新·AI娱乐"}}, "required": ["board"]},
+            "then": {"properties": {"track": {"enum": ["AI模型与应用（娱乐向）", "创新硬件（娱乐向）"]}}}
+          },
+          {
+            "if": {"properties": {"board": {"const": "全球融资"}}, "required": ["board"]},
+            "then": {"properties": {"track": {"enum": ["泛娱乐融资", "泛AI·AI应用融资"]}}}
+          },
+          {
+            "if": {"properties": {"template": {"const": "C"}}, "required": ["template"]},
+            "then": {"properties": {"paragraphs": {"minItems": 2, "maxItems": 2}, "bullets": {"maxItems": 0}}}
+          },
+          {
+            "if": {"properties": {"template": {"const": "A"}}, "required": ["template"]},
+            "then": {"properties": {"paragraphs": {"maxItems": 1}, "bullets": {"minItems": 1}}}
+          },
+          {
+            "if": {"properties": {"template": {"const": "B"}}, "required": ["template"]},
+            "then": {"properties": {"paragraphs": {"minItems": 1, "maxItems": 2}}}
+          },
+          {
+            "if": {"properties": {"image_layout": {"enum": ["single", "two_column", "stacked"]}}, "required": ["image_layout"]},
+            "then": {"required": ["images"], "properties": {"images": {"minItems": 1}}}
+          }
+        ]
+      }
+    },
+    "manual_overrides": {
+      "type": "array",
+      "description": "仅作索引，真值以 items[] 中 source=manual 的条目为准；renderer/check_report 不读此处内容做渲染",
+      "items": {
+        "type": "object",
+        "required": ["id", "reason"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^m-\\d{2,}$"},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "notes": {"type": "string", "description": "本日特殊判断备忘"}
+  }
+}

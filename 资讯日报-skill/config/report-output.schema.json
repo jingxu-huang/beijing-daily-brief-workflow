@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["report_markdown"],
+  "properties": {
+    "report_markdown": {
+      "type": "string",
+      "minLength": 100,
+      "maxLength": 200000
+    }
+  }
+}
