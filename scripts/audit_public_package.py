@@ -20,6 +20,7 @@ TEXT_SUFFIXES = {
     ".md",
     ".plist",
     ".py",
+    ".sha256",
     ".sh",
     ".toml",
     ".txt",
@@ -127,10 +128,18 @@ def scan_zip(path: Path) -> list[tuple[str, str]]:
     return findings
 
 
+def scan_asset(path: Path) -> list[tuple[str, str]]:
+    relative = PurePosixPath(path.name)
+    findings = [(str(relative), reason) for reason in path_violations(relative)]
+    findings.extend((str(relative), reason) for reason in scan_text(str(relative), path.read_bytes()))
+    return findings
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--archive", type=Path)
+    parser.add_argument("--asset", action="append", type=Path, default=[])
     parser.add_argument("--deny-term", action="append", default=[])
     parser.add_argument("--deny-env-file", action="append", type=Path, default=[])
     parser.add_argument("--deny-local-context", action="store_true")
@@ -139,6 +148,8 @@ def main() -> int:
     findings = scan_root(root)
     if args.archive:
         findings.extend((f"archive:{name}", reason) for name, reason in scan_zip(args.archive))
+    for asset in args.asset:
+        findings.extend((f"asset:{name}", reason) for name, reason in scan_asset(asset))
     denied_terms = list(args.deny_term)
     sensitive_env_keys = {
         "FEISHU_APP_ID",
@@ -174,21 +185,22 @@ def main() -> int:
     denied_terms = sorted({term for term in denied_terms if len(term) >= 4})
     if denied_terms:
         targets = repo_files(root)
+        extra_text = ""
         if args.archive:
             with zipfile.ZipFile(args.archive) as archive:
-                archive_text = b"\n".join(
+                extra_text += b"\n".join(
                     archive.read(info)
                     for info in archive.infolist()
                     if not info.is_dir() and PurePosixPath(info.filename).suffix.lower() in TEXT_SUFFIXES
                 ).decode("utf-8", errors="ignore")
-        else:
-            archive_text = ""
+        for asset in args.asset:
+            extra_text += "\n" + asset.read_text(encoding="utf-8", errors="ignore")
         for term in denied_terms:
             for path in targets:
                 if term and term in path.read_text(encoding="utf-8", errors="ignore"):
                     findings.append((str(path.relative_to(root)), "explicit denied term"))
-            if term and term in archive_text:
-                findings.append(("archive", "explicit denied term"))
+            if term and term in extra_text:
+                findings.append(("external asset", "explicit denied term"))
     if findings:
         print("PUBLIC PACKAGE AUDIT FAILED", file=sys.stderr)
         for name, reason in sorted(set(findings)):

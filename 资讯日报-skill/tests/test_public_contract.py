@@ -29,6 +29,26 @@ class PublicPackageContractTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_audit_rejects_absolute_path_in_checksum_asset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checksum = Path(tmp) / "release.zip.sha256"
+            private_path = Path("/") / "Volumes" / "PrivateDisk" / "release.zip"
+            checksum.write_text(f"{'0' * 64}  {private_path}\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/audit_public_package.py"),
+                    "--root",
+                    str(REPO_ROOT),
+                    "--asset",
+                    str(checksum),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,15 @@ cd "$ROOT_DIR"
 test -d .git || { echo "Initialize and commit the clean repository first." >&2; exit 1; }
 mkdir -p release
 git archive --format=zip --prefix="$NAME/" --output="$ARCHIVE" HEAD
-shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
-python3 scripts/audit_public_package.py --root "$ROOT_DIR" --archive "$ARCHIVE"
+python3 - "$ARCHIVE" "$ARCHIVE.sha256" "$NAME.zip" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+archive, checksum, public_name = map(Path, sys.argv[1:])
+digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+checksum.write_text(f"{digest}  {public_name.name}\n", encoding="utf-8")
+PY
+python3 scripts/audit_public_package.py --root "$ROOT_DIR" --archive "$ARCHIVE" --asset "$ARCHIVE.sha256"
 echo "$ARCHIVE"
 echo "$ARCHIVE.sha256"
