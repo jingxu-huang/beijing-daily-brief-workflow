@@ -35,6 +35,7 @@ DRAFT_DIR="${RIBAO_DRAFT_DIR:-$DATA_ROOT/日报草稿}"
 CHECK_DIR="${RIBAO_CHECK_DIR:-$DATA_ROOT/日报质检}"
 STATE_DIR="${RIBAO_STATE_DIR:-$DATA_ROOT/日报状态}"
 FEISHU_CLI_SCRIPT="$ROOT_DIR/local-only/feishu-bot/send_to_feishu_cli.py"
+FEISHU_INDEX_SCRIPT="$ROOT_DIR/local-only/feishu-bot/update_daily_index.py"
 REPORT_CHAT_ID="${FEISHU_REPORT_CHAT_ID:-}"
 mkdir -p "$REPORT_DIR" "$DRAFT_DIR" "$CHECK_DIR" "$STATE_DIR"
 
@@ -42,6 +43,7 @@ mkdir -p "$REPORT_DIR" "$DRAFT_DIR" "$CHECK_DIR" "$STATE_DIR"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
 NVM_BIN="$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"
 [ -n "$NVM_BIN" ] && export PATH="$NVM_BIN:$PATH"
+PYTHON_BIN="${RIBAO_PYTHON_BIN:-python3}"
 
 # 时钟对表（2026-07-13 起先于目标日期计算：目标日期与 manifest 时间戳都由系统 UTC 推导，
 # 而系统 UTC 本身可能配错——实测本机时区留在国外、墙钟手动拨到北京时间，系统 UTC 快约 15 小时）。
@@ -49,7 +51,7 @@ NVM_BIN="$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -
 # fetch_news.py / manifest.py，两者在 |skew|>300s 时先扣除偏差再换算北京时间。
 SKEW=""
 if [ -z "${RIBAO_TRUSTED_UTC:-}" ]; then
-SKEW="$(python3 - <<'PY' 2>/dev/null
+SKEW="$("$PYTHON_BIN" - <<'PY' 2>/dev/null
 import urllib.request, email.utils, datetime as dt, random
 try:
     # 防缓存：唯一查询参数 + no-cache 头，避免中间代理返回旧的 Date 头造成假偏差
@@ -69,21 +71,21 @@ if [[ "$SKEW" =~ ^-?[0-9]+$ ]]; then
 fi
 
 # 目标日期：守门器传入；手动执行时取最近一个已闭合的北京15:00窗口。
-YMD="${RIBAO_TARGET_YMD:-$(python3 "$SKILL_DIR/fetch_news.py" --print-date)}"
+YMD="${RIBAO_TARGET_YMD:-$("$PYTHON_BIN" "$SKILL_DIR/fetch_news.py" --print-date)}"
 export RIBAO_TARGET_YMD="$YMD"
-MD="$(python3 -c 'import sys; y=sys.argv[1]; print(f"{int(y[4:6])}.{int(y[6:8])}")' "$YMD")"
+MD="$("$PYTHON_BIN" -c 'import sys; y=sys.argv[1]; print(f"{int(y[4:6])}.{int(y[6:8])}")' "$YMD")"
 DRAFT="$DRAFT_DIR/资讯日报-草稿-${YMD}.md"
 REPORT="$REPORT_DIR/资讯类简报-${MD}日.md"
 CHECK="$CHECK_DIR/资讯日报-质检-${YMD}.md"
 LOG_HINT="状态见 日报状态/run-manifest-${YMD}.json"
 
-MANIFEST() { python3 "$SKILL_DIR/manifest.py" --date "$YMD" --state-dir "$STATE_DIR" "$@" || true; }
+MANIFEST() { "$PYTHON_BIN" "$SKILL_DIR/manifest.py" --date "$YMD" --state-dir "$STATE_DIR" "$@" || true; }
 
 # alert <tag> <正文>：飞书 + macOS 通知双通道；告警本身失败绝不中断流程
 alert() {
   local tag="$1" text="$2"
   echo "[$(date '+%F %T')] ALERT(${tag}): ${text}"
-  # 守门器托管时，外部告警统一由它按 15:30 硬截止去重发送；wrapper 只落日志和 manifest。
+  # 守门器托管时，外部告警统一由它按 14:00 硬截止去重发送；wrapper 只落日志和 manifest。
   if [ "${RIBAO_GUARD_MANAGED:-0}" = "1" ]; then
     return 0
   fi
@@ -169,17 +171,41 @@ if [ ! -f "$FEISHU_CLI_SCRIPT" ]; then
 fi
 
 if [ -z "$REPORT_CHAT_ID" ]; then
-  MANIFEST --step publish --status skipped --detail "FEISHU_REPORT_CHAT_ID not configured"
-  MANIFEST --final generated --kv "reason=飞书群未配置"
-  echo "[$(date '+%F %T')] 已生成并通过质检；FEISHU_REPORT_CHAT_ID 未配置，明确跳过飞书发送。"
-  exit 0
+  if [ "${FEISHU_DOC_ONLY:-0}" = "1" ]; then
+    echo "[$(date '+%F %T')] 4/4 导入飞书文档（doc-only；不授权群、不发送消息）..."
+    if "$PYTHON_BIN" "$FEISHU_CLI_SCRIPT" --report "$REPORT" --check "$CHECK" --date "$YMD" --import-as "${FEISHU_CLI_IMPORT_AS:-bot}" --doc-only; then
+      MANIFEST --step publish --status ok --detail "doc-only"
+      if [ "${FEISHU_DAILY_INDEX:-0}" = "1" ]; then
+        echo "[$(date '+%F %T')] 5/5 更新飞书日报链接索引..."
+        if "$PYTHON_BIN" "$FEISHU_INDEX_SCRIPT" --date "$YMD" --import-as "${FEISHU_CLI_IMPORT_AS:-bot}"; then
+          MANIFEST --step index --status ok
+        else
+          MANIFEST --step index --status fail
+          MANIFEST --final failed --kv "reason=飞书日报链接索引更新失败"
+          alert indexfail "日报文档已生成，但飞书日报链接索引更新失败。请排查后重跑本脚本"
+          exit 1
+        fi
+      fi
+      MANIFEST --final generated --kv "reason=飞书文档已生成，未配置群发送"
+      exit 0
+    fi
+    MANIFEST --step publish --status fail --detail "doc-only import failed"
+    MANIFEST --final failed --kv "reason=飞书文档导入失败"
+    alert docimportfail "质检 ${VERDICT}，但飞书文档导入失败。成稿在 日报文档/资讯类简报-${MD}日.md，排查后重跑本脚本即可"
+    exit 1
+  else
+    MANIFEST --step publish --status skipped --detail "FEISHU_REPORT_CHAT_ID not configured"
+    MANIFEST --final generated --kv "reason=飞书群未配置"
+    echo "[$(date '+%F %T')] 已生成并通过质检；FEISHU_REPORT_CHAT_ID 未配置，明确跳过飞书发送。"
+    exit 0
+  fi
 fi
 
 echo "[$(date '+%F %T')] 4/4 投递飞书（结论：${VERDICT}；同日已有文档则原地更新，不新建链接）..."
-if python3 "$FEISHU_CLI_SCRIPT" --report "$REPORT" --check "$CHECK" --date "$YMD" --chat-id "$REPORT_CHAT_ID" --perm edit --send-as "${FEISHU_CLI_SEND_AS:-bot}"; then
+if "$PYTHON_BIN" "$FEISHU_CLI_SCRIPT" --report "$REPORT" --check "$CHECK" --date "$YMD" --chat-id "$REPORT_CHAT_ID" --perm edit --send-as "${FEISHU_CLI_SEND_AS:-bot}"; then
   MANIFEST --step publish --status ok
   MANIFEST --final sent
-  if REMOVED="$(python3 "$SKILL_DIR/codex_external.py" --root "$ROOT_DIR" cleanup-success --date "$YMD")"; then
+  if REMOVED="$("$PYTHON_BIN" "$SKILL_DIR/codex_external.py" --root "$ROOT_DIR" cleanup-success --date "$YMD")"; then
     MANIFEST --step codex_cleanup --status ok --detail "removed_external_workdirs=${REMOVED}"
   else
     CLEANUP_RC=$?

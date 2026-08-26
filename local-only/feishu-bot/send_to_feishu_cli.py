@@ -35,6 +35,7 @@ DATA_ROOT = Path(os.environ.get("RIBAO_DATA_ROOT") or PROJECT_ROOT)
 STATE_DIR = Path(os.environ.get("RIBAO_STATE_DIR") or (DATA_ROOT / "日报状态"))
 REGISTRY_PATH = STATE_DIR / "feishu-docs.json"
 MANIFEST_HELPER = PROJECT_ROOT / "资讯日报-skill" / "manifest.py"
+STAGING_DIR = SCRIPT_DIR / ".staging"
 
 
 def load_registry():
@@ -82,7 +83,7 @@ def record_manifest(ymd, kvs):
     if not MANIFEST_HELPER.exists():
         return
     try:
-        cmd = [sys.executable, str(MANIFEST_HELPER), "--date", ymd]
+        cmd = [sys.executable, str(MANIFEST_HELPER), "--date", ymd, "--state-dir", str(STATE_DIR)]
         for k, v in kvs.items():
             cmd += ["--kv", f"{k}={v}"]
         subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
@@ -162,6 +163,23 @@ def project_relative(path):
     except ValueError as exc:
         raise RuntimeError(f"文件必须位于日报项目目录内：{resolved}") from exc
     return "./" + rel.as_posix()
+
+
+def stage_report_for_lark(report_path, ymd):
+    """lark-cli only accepts paths relative to cwd; stage external data-root reports locally."""
+    resolved = Path(report_path).resolve()
+    try:
+        resolved.relative_to(PROJECT_ROOT)
+        return str(resolved)
+    except ValueError:
+        pass
+    if not resolved.exists():
+        raise RuntimeError(f"成稿文件不存在：{resolved}")
+    target_dir = STAGING_DIR / (ymd or "unknown")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / resolved.name
+    shutil.copy2(resolved, target)
+    return str(target)
 
 
 def parse_json_output(stdout):
@@ -457,6 +475,7 @@ def main():
     parser.add_argument("--permission-as", default="", choices=("", "bot", "user"), help="文档授权身份，默认跟随导入身份")
     parser.add_argument("--allow-fail", action="store_true", help="即使质检 FAIL 也发送")
     parser.add_argument("--dry-run", action="store_true", help="只打印将执行的 lark-cli 命令")
+    parser.add_argument("--doc-only", action="store_true", help="只导入/更新飞书 Docx，不授权群聊、不发送 IM 消息")
     parser.add_argument("--date", default="", help="目标日期 YYYYMMDD；默认从成稿文件名推断（会猜年份，wrapper 应显式传入）")
     parser.add_argument(
         "--mode",
@@ -502,13 +521,14 @@ def main():
         or import_as
     )
 
-    if not chat_id:
+    if not chat_id and not args.doc_only:
         raise RuntimeError("缺少日报接收群 chat_id")
-    if perm != "edit":
+    if not args.doc_only and perm != "edit":
         raise RuntimeError("日报群成员必须可编辑，请使用 --perm edit")
 
     title = title_from_path(args.report)
     ymd = args.date.strip() or ymd_from_path(args.report)
+    lark_report = stage_report_for_lark(args.report, ymd)
     idempotency_suffix = os.environ.get("FEISHU_IDEMPOTENCY_SUFFIX", "").strip()
 
     registry = load_registry()
@@ -525,12 +545,15 @@ def main():
         doc_token = entry["doc_token"]
         doc_url = entry.get("url", "")
         print(f"[feishu-cli] {ymd} 已有当日文档，原地更新：{doc_url or doc_token}")
-        update_report_in_place(doc_token, args.report, update_as=import_as, dry_run=args.dry_run)
-        grant_chat_edit(doc_token, chat_id, perm, permission_as=permission_as, dry_run=args.dry_run)
-        message_id = entry.get("message_id", "")
+        update_report_in_place(doc_token, lark_report, update_as=import_as, dry_run=args.dry_run)
+        if args.doc_only:
+            message_id = entry.get("message_id", "")
+        else:
+            grant_chat_edit(doc_token, chat_id, perm, permission_as=permission_as, dry_run=args.dry_run)
+            message_id = entry.get("message_id", "")
         # 正常同链更新不重复发群消息；若首发曾卡在“文档已登记、URL 消息未成功”之间，
         # 必须用同一幂等键补发，不能把只有文档、没有群消息的状态误判为已送达。
-        if not message_id:
+        if not args.doc_only and not message_id:
             message = send_chat_message(
                 chat_id,
                 doc_url,
@@ -541,7 +564,7 @@ def main():
             message_id = message_id_from_result(message, dry_run=args.dry_run)
             entry["message_id"] = message_id
     else:
-        doc_token, doc_url = import_report(args.report, title, import_as=import_as, dry_run=args.dry_run)
+        doc_token, doc_url = import_report(lark_report, title, import_as=import_as, dry_run=args.dry_run)
         # 关键顺序：先写注册表、再授权发消息——后续任何一步失败，重跑都会走同链更新，
         # 不会再新建第二篇 Docx。
         entry = {
@@ -554,34 +577,39 @@ def main():
         if not args.dry_run:
             registry[ymd] = entry
             save_registry(registry)
-        grant_chat_edit(doc_token, chat_id, perm, permission_as=permission_as, dry_run=args.dry_run)
-        warning = wewe_warning_from_draft(args.report, ymd)
-        if warning:
-            send_wewe_warning(
+        if args.doc_only:
+            message_id = ""
+        else:
+            grant_chat_edit(doc_token, chat_id, perm, permission_as=permission_as, dry_run=args.dry_run)
+            warning = wewe_warning_from_draft(args.report, ymd)
+            if warning:
+                send_wewe_warning(
+                    chat_id,
+                    warning,
+                    send_as,
+                    with_idempotency_suffix(f"ribao-{ymd}-wewe-warning-{send_as}", idempotency_suffix),
+                    dry_run=args.dry_run,
+                )
+            message = send_chat_message(
                 chat_id,
-                warning,
+                doc_url,
                 send_as,
-                with_idempotency_suffix(f"ribao-{ymd}-wewe-warning-{send_as}", idempotency_suffix),
+                with_idempotency_suffix(f"ribao-{ymd}-cli-docx-{send_as}", idempotency_suffix),
                 dry_run=args.dry_run,
             )
-        message = send_chat_message(
-            chat_id,
-            doc_url,
-            send_as,
-            with_idempotency_suffix(f"ribao-{ymd}-cli-docx-{send_as}", idempotency_suffix),
-            dry_run=args.dry_run,
-        )
-        message_id = message_id_from_result(message, dry_run=args.dry_run)
-        entry["message_id"] = message_id
+            message_id = message_id_from_result(message, dry_run=args.dry_run)
+            entry["message_id"] = message_id
 
-    verify_chat_message(message_id, doc_url, send_as, dry_run=args.dry_run)
+    if not args.doc_only:
+        verify_chat_message(message_id, doc_url, send_as, dry_run=args.dry_run)
 
     entry["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     entry["last_verdict"] = verdict
+    entry["doc_only"] = bool(args.doc_only)
     if not args.dry_run:
         registry[ymd] = entry
         save_registry(registry)
-        record_manifest(ymd, {"doc_url": entry.get("url", ""), "publish_mode": mode})
+        record_manifest(ymd, {"doc_url": entry.get("url", ""), "publish_mode": "doc-only" if args.doc_only else mode})
 
     print(
         json.dumps(
@@ -598,6 +626,7 @@ def main():
                 "permission_as": permission_as,
                 "send_as": send_as,
                 "message_id": message_id,
+                "doc_only": bool(args.doc_only),
             },
             ensure_ascii=False,
             indent=2,

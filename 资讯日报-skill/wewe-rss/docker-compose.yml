@@ -3,7 +3,7 @@
 # 起来后打开 http://localhost:4000 ，用下面的 AUTH_CODE 登录后台
 services:
   wewe-rss:
-    image: cooderl/wewe-rss-sqlite:latest      # SQLite 单容器，最省事（试用够用）
+    image: cooderl/wewe-rss-sqlite:2.6.1      # 固定版本，避免迁移后被 latest 静默升级
     container_name: wewe-rss
     restart: unless-stopped
     ports:
@@ -13,7 +13,7 @@ services:
       - AUTH_CODE=${WEWE_AUTH_CODE:?Set WEWE_AUTH_CODE in a local .env file}
       - FEED_MODE=fulltext                    # 输出全文，日报浓缩才有料
       - SERVER_ORIGIN_URL=http://localhost:4000
-      - CRON_EXPRESSION=20 13 * * *           # 13:20 预刷新，供 13:30 固定健康检查使用
+      - CRON_EXPRESSION=0 12 * * *            # 12:00 首轮刷新；14:30 由日报守门器执行最后一轮
       - UPDATE_DELAY_TIME=150s                # 连续更新间隔，提高到150s进一步降低被封控概率
       - TZ=Asia/Shanghai
     volumes:

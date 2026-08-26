@@ -17,23 +17,28 @@ set -a
 # shellcheck disable=SC1090
 . "$CONFIG_FILE"
 set +a
+PYTHON_BIN="${RIBAO_PYTHON_BIN:-python3}"
 
 if [ -z "${RIBAO_DATA_ROOT:-}" ] || [ ! -d "$RIBAO_DATA_ROOT" ]; then
   echo "RIBAO_DATA_ROOT must be an existing directory on an external volume." >&2
   exit 1
 fi
 
-/usr/bin/python3 - "$RIBAO_DATA_ROOT" <<'PY'
+"$PYTHON_BIN" - "$RIBAO_DATA_ROOT" <<'PY'
 import os, pathlib, sys
 path = pathlib.Path(sys.argv[1]).expanduser().resolve(strict=True)
+allow_system_root = os.getenv("RIBAO_ALLOW_SYSTEM_DATA_ROOT") == "1"
 mount = path
 while mount.parent != mount and not os.path.ismount(mount):
     mount = mount.parent
-if mount == pathlib.Path("/"):
+if mount == pathlib.Path("/") and not allow_system_root:
     raise SystemExit("RIBAO_DATA_ROOT is on the system root mount; refusing installation")
+if mount == pathlib.Path("/") and allow_system_root:
+    print("WARN: RIBAO_DATA_ROOT is on the system root mount; allowed by RIBAO_ALLOW_SYSTEM_DATA_ROOT=1")
 PY
 
 mkdir -p "$RUNTIME_DIR" "$CONTROL_HOME" "$HOME/Library/LaunchAgents"
+chmod u+w "$CONTROL_HOME/config.toml" "$CONTROL_HOME/report-output.schema.json" 2>/dev/null || true
 cp "$ROOT_DIR/资讯日报-skill/ribao_guard.py" "$RUNTIME_DIR/ribao_guard.py"
 cp "$ROOT_DIR/资讯日报-skill/beijing_time.py" "$RUNTIME_DIR/beijing_time.py"
 cp "$ROOT_DIR/资讯日报-skill/run_guard.sh" "$RUNTIME_DIR/run_guard.sh"
@@ -60,10 +65,10 @@ cp "$CONFIG_FILE" "$RUNTIME_DIR/guard.env"
 } >> "$RUNTIME_DIR/guard.env"
 chmod 600 "$RUNTIME_DIR/guard.env"
 
-ACTIVATE_YMD="$(RIBAO_INSTALL_RUNTIME="$RUNTIME_DIR" PYTHONPATH="$RUNTIME_DIR" /usr/bin/python3 -c 'import datetime as d, os; from pathlib import Path; from beijing_time import TrustedClock,to_beijing; n,_=TrustedClock(Path(os.environ["RIBAO_INSTALL_RUNTIME"])/"trusted-time.json").now(); b=to_beijing(n); day=b.date() if b.time()<d.time(13,30) else b.date()+d.timedelta(days=1); print(day.strftime("%Y%m%d"))')"
+ACTIVATE_YMD="$(RIBAO_INSTALL_RUNTIME="$RUNTIME_DIR" PYTHONPATH="$RUNTIME_DIR" "$PYTHON_BIN" -c 'import datetime as d, os; from pathlib import Path; from beijing_time import TrustedClock,to_beijing; n,_=TrustedClock(Path(os.environ["RIBAO_INSTALL_RUNTIME"])/"trusted-time.json").now(); b=to_beijing(n); day=b.date() if b.time()<d.time(14,30) else b.date()+d.timedelta(days=1); print(day.strftime("%Y%m%d"))')"
 printf 'RIBAO_GUARD_ACTIVATE_YMD=%s\n' "$ACTIVATE_YMD" >> "$RUNTIME_DIR/guard.env"
 
-/usr/bin/python3 - "$TEMPLATE" "$PLIST_DST" "$ROOT_DIR" "$RUNTIME_DIR" "$PATH" <<'PY'
+"$PYTHON_BIN" - "$TEMPLATE" "$PLIST_DST" "$ROOT_DIR" "$RUNTIME_DIR" "$PATH" <<'PY'
 from pathlib import Path
 import sys
 template, output, root, runtime, path = sys.argv[1:]

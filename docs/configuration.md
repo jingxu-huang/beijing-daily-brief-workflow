@@ -12,7 +12,8 @@ Copy `config.env.example` to the gitignored `config.env`.
 | `WEWE_ALL_FEED_URL` | no | Aggregate feed; defaults to the localhost sample. |
 | `RELOGIN_TOKEN` | for remote login | Long public-page token; installer generates it when blank. |
 | `RELOGIN_ADMIN_TOKEN` | for remote login | Admin API token; installer generates it when blank. |
-| `RIBAO_WEWE_CHECK_1` | fixed | Must remain `13:30`. |
+| `RIBAO_WEWE_CHECK_1` | fixed | Must remain `11:00` (single-source live login validation). |
+| `RIBAO_WEWE_REFRESH_1` | fixed | Must remain `12:00` (first full refresh). |
 | `RIBAO_WEWE_CHECK_2` | fixed | Must remain `14:30`. |
 
 Do not put secrets in launchd plist templates or source files. The guard installer copies the local config into a mode-600 runtime env file.

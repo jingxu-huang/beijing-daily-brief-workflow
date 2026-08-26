@@ -14,6 +14,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+import sys
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -107,6 +108,10 @@ def validate_root(root: Path) -> Path:
         raise ExternalRuntimeError(f"unexpected project root: {actual}; expected {expected}")
     validate_data_root()
     return actual
+
+
+def python_bin() -> str:
+    return os.getenv("RIBAO_PYTHON_BIN", sys.executable)
 
 
 def validate_workflow_paths(root: Path) -> None:
@@ -213,6 +218,19 @@ def extract_report(root: Path, work: Path, ymd: str) -> Path:
     return candidate
 
 
+QA_SKIP_COMMENT_RE = re.compile(
+    r"^[ \t]*<!--\s*QA_SKIP\b(?:(?!-->).)*-->[ \t]*(?:\n|$)",
+    flags=re.I | re.S | re.M,
+)
+
+
+def strip_internal_publish_comments(text: str) -> str:
+    """Remove QC-only annotations that must never appear in the published Docx."""
+    sanitized = QA_SKIP_COMMENT_RE.sub("", text or "")
+    sanitized = re.sub(r"\n{4,}", "\n\n\n", sanitized)
+    return sanitized.strip() + "\n"
+
+
 def validate_publish(root: Path, work: Path, report: Path, check: Path) -> None:
     root = validate_root(root)
     data_root = validate_data_root()
@@ -229,6 +247,14 @@ def validate_publish(root: Path, work: Path, report: Path, check: Path) -> None:
         raise ExternalRuntimeError(f"unexpected final check directory: {check.parent}")
     if report.is_symlink() or check.is_symlink():
         raise ExternalRuntimeError("final report/check path must not be a symlink")
+    # QA_SKIP comments are intentionally present during QC so check_report.py can
+    # distinguish explicitly rejected candidates from accidental omissions.
+    # Feishu Docx import renders HTML comments as visible text, so the trusted
+    # publish wrapper strips these internal annotations only after QC has passed.
+    original = candidate.read_text(encoding="utf-8")
+    sanitized = strip_internal_publish_comments(original)
+    if sanitized != original:
+        atomic_write(candidate, sanitized)
 
 
 def cleanup_success(root: Path, ymd: str) -> int:
@@ -526,7 +552,7 @@ def run_quality_check(root: Path, work: Path, draft: Path, candidate: Path) -> t
     check = work / "check.md"
     qc = subprocess.run(
         [
-            "/usr/bin/python3",
+            python_bin(),
             str(root / "资讯日报-skill" / "check_report.py"),
             "--draft",
             str(draft),

@@ -4,6 +4,7 @@ __pycache__/
 .env
 config.env
 local-only/feishu-bot/feishu_bot.env
+local-only/feishu-bot/.staging/
 local-only/relogin.env
 release/
 日报草稿/

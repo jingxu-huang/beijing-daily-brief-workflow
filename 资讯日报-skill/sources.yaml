@@ -55,9 +55,9 @@ sources:
     board: 创新·AI娱乐
     track: AI模型与应用（娱乐向）
     type: rss
-    url: "https://36kr.com/feed"
+    route: "/36kr/hot-list/24"
     autoclassify: true
-    note: "✅ 原生feed带完整正文(数千字深度文)+时间戳，补'观点/解读'维度；按标题自动分流。注意是综合源，靠关键词降噪"
+    note: "RSSHub 24小时热榜；原生 https://36kr.com/feed 当前返回 HTML，改走本机/自建 RSSHub 路由；按标题自动分流。注意是综合源，靠关键词降噪"
     enabled: true
 
   - name: ProductHunt
@@ -108,19 +108,20 @@ sources:
     board: 泛娱乐·出海
     track: 休闲游戏
     type: rss
-    route: "/touchgame"          # 触乐网，RSSHub 路由
+    route: "/chuapp/news"        # 触乐网，RSSHub 路由
     enabled: true
   - name: GameLook
     board: 泛娱乐·出海
     track: 休闲游戏
     type: web
-    url: "https://www.gamelook.com.cn/feed"
+    url: "http://www.gamelook.com.cn/feed"
     enabled: true
   - name: PocketGamer.biz
     board: 泛娱乐·出海
     track: 休闲游戏
     type: web
-    url: "https://www.pocketgamer.biz/rss/"
+    url: "https://www.pocketgamer.biz/index.rss"
+    curl_fallback: true
     enabled: true
 
   # —— 游戏 / 出海（公众号，需 WeWe RSS 或人工）——
@@ -409,8 +410,15 @@ sources:
   - name: Sensor Tower 博客
     board: 泛娱乐·出海
     track: 其他
-    type: web
-    url: "https://sensortower.com/blog/rss"
+    type: sitemap
+    sitemaps:
+      - "https://sensortower.com/en-US-blog-sitemap-1.xml"
+    link_pattern: "^https://sensortower\\.com/blog/"
+    fetch_body: true
+    body_limit: 12
+    body_chars: 900
+    item_limit: 40
+    note: "官方 /blog/rss 当前 404，RSSHub /sensortower/blog 当前 503；改走公开 blog sitemap 的 lastmod + 正文抓取。"
     enabled: true
   - name: 快出海-报告
     board: 泛娱乐·出海

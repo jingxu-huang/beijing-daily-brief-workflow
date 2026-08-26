@@ -5,9 +5,10 @@
 ```mermaid
 flowchart LR
     T["Trusted UTC quorum"] --> B["Asia/Shanghai business clock"]
-    B --> W1["13:30 WeWe check + two-channel reminder"]
-    W1 --> W2["14:30 retry reminder if unavailable"]
-    W2 --> C["15:00 freeze source set and close window"]
+    B --> W1["11:00 WeWe live-login validation + two-channel reminder"]
+    W1 --> W2["12:00 full refresh"]
+    W2 --> W3["14:30 final full refresh"]
+    W3 --> C["15:00 freeze source set and close window"]
     C --> F["Fetch other sources; WeWe is optional"]
     F --> G["Codex stdin-only composition"]
     G --> Q["Independent QC; up to 2 repair rounds"]

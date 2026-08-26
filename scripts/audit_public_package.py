@@ -66,9 +66,14 @@ def content_patterns():
 
 
 def repo_files(root: Path) -> list[Path]:
-    if (root / ".git").exists():
+    in_worktree = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=root,
+        capture_output=True,
+    )
+    if in_worktree.returncode == 0:
         result = subprocess.run(
-            ["git", "ls-files", "-z"],
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             cwd=root,
             capture_output=True,
             check=True,

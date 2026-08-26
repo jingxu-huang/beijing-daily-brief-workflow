@@ -23,13 +23,14 @@ from pathlib import Path
 from beijing_time import BEIJING, TrustedClock, TimeAuthorityError, monotonic_seconds, to_beijing
 
 
-CHECK_1 = dt.time(13, 30)
-CHECK_2 = dt.time(14, 30)
+CHECK_1 = dt.time(11, 0)  # 登录态验证
+REFRESH_1 = dt.time(12, 0)  # 首轮全量刷新
+CHECK_2 = dt.time(14, 30)  # 最后一轮全量刷新与最终可用性检查
 WINDOW_END = dt.time(15, 0)
 DEADLINE_ALERT = dt.time(15, 30)
 DELIVERY_DEADLINE = dt.time(15, 30)
 DAILY_RETRY_BACKOFF = dt.timedelta(minutes=10)
-EXPECTED_FIXED_TIMES = {"check_1": "13:30", "check_2": "14:30"}
+EXPECTED_FIXED_TIMES = {"check_1": "11:00", "refresh_1": "12:00", "check_2": "14:30"}
 DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -194,11 +195,37 @@ def load_wewe_module(skill_dir: Path):
     return module
 
 
-def probe_wewe(skill_dir: Path) -> dict:
+def probe_wewe(skill_dir: Path, target_ymd: str = "", refresh_mode: str = "all") -> dict:
+    previous_target = os.environ.get("RIBAO_TARGET_YMD")
+    previous_refresh = os.environ.get("WEWE_REFRESH_FEEDS")
+    previous_refresh_mode = os.environ.get("WEWE_REFRESH_MODE")
     try:
+        if target_ymd:
+            os.environ["RIBAO_TARGET_YMD"] = target_ymd
+        # Guard probes are the automation's source freshness gate. They should
+        # refresh enabled WeWe feeds by default even if an older local env file
+        # still has WEWE_REFRESH_FEEDS=0. Set WEWE_GUARD_REFRESH_FEEDS=0 only
+        # for explicit troubleshooting/dry runs.
+        if refresh_mode not in {"single", "all"}:
+            raise ValueError(f"unsupported WeWe refresh mode: {refresh_mode}")
+        os.environ["WEWE_REFRESH_FEEDS"] = os.getenv("WEWE_GUARD_REFRESH_FEEDS", "1")
+        os.environ["WEWE_REFRESH_MODE"] = refresh_mode
         return load_wewe_module(skill_dir).probe_health()
     except Exception as exc:  # noqa: BLE001
         return {"status": "service_down", "reason": str(exc)[:1000]}
+    finally:
+        if previous_target is None:
+            os.environ.pop("RIBAO_TARGET_YMD", None)
+        else:
+            os.environ["RIBAO_TARGET_YMD"] = previous_target
+        if previous_refresh is None:
+            os.environ.pop("WEWE_REFRESH_FEEDS", None)
+        else:
+            os.environ["WEWE_REFRESH_FEEDS"] = previous_refresh
+        if previous_refresh_mode is None:
+            os.environ.pop("WEWE_REFRESH_MODE", None)
+        else:
+            os.environ["WEWE_REFRESH_MODE"] = previous_refresh_mode
 
 
 class Guard:
@@ -212,13 +239,14 @@ class Guard:
         self.runtime_state_dir.mkdir(parents=True, exist_ok=True)
         self.chat_id = os.getenv("FEISHU_REPORT_CHAT_ID", "").strip()
 
-    def probe_wewe(self) -> dict:
+    def probe_wewe(self, state: dict | None = None, refresh_mode: str = "all") -> dict:
         if self.shadow:
             return {
                 "status": os.getenv("RIBAO_SHADOW_WEWE_STATUS", "healthy"),
                 "reason": os.getenv("RIBAO_SHADOW_WEWE_REASON", "shadow probe"),
             }
-        return probe_wewe(self.skill_dir)
+        target_ymd = state.get("target_ymd", "") if isinstance(state, dict) else ""
+        return probe_wewe(self.skill_dir, target_ymd=target_ymd, refresh_mode=refresh_mode)
 
     def state_path(self, ymd: str) -> Path:
         return self.runtime_state_dir / f"beijing-guard-{ymd}.json"
@@ -244,7 +272,8 @@ class Guard:
 
     def fixed_config_ok(self) -> bool:
         configured = {
-            "check_1": os.getenv("RIBAO_WEWE_CHECK_1", "13:30"),
+            "check_1": os.getenv("RIBAO_WEWE_CHECK_1", "11:00"),
+            "refresh_1": os.getenv("RIBAO_WEWE_REFRESH_1", "12:00"),
             "check_2": os.getenv("RIBAO_WEWE_CHECK_2", "14:30"),
         }
         return configured == EXPECTED_FIXED_TIMES
@@ -254,7 +283,7 @@ class Guard:
         entry["probe"] = probe
         # 只要尚未恢复到可用状态，固定提醒就必须执行。service_down 也算
         # “未恢复”，不能因为探测错误类型变化而吞掉 14:30 的第二次提醒。
-        if probe.get("status") in {"healthy", "stale"}:
+        if probe.get("status") == "healthy":
             entry.update(
                 {
                     "status": "ok",
@@ -284,7 +313,7 @@ class Guard:
             module = load_wewe_module(self.skill_dir)
             result = module.send_fixed_guard_reminder(
                 target_ymd=state["target_ymd"],
-                stage=stage.replace("wewe_check_", ""),
+                stage=stage.rsplit("_", 1)[-1],
                 reason=probe.get("reason", "微信读书账号失效"),
                 send_feishu=not bool(previous.get("feishu_verified")),
                 show_dialog=not bool(previous.get("dialog_started")),
@@ -296,7 +325,10 @@ class Guard:
         merged.update(result)
         entry.update(
             {
-                "status": "ok" if merged.get("feishu_verified") and merged.get("dialog_started") else "fail",
+                # 提醒是否送达不能代表 WeWe 已恢复。若服务仍不可用，保留
+                # unavailable，让下一轮守门器继续探测并在恢复后触发刷新。
+                # 弹窗/飞书提醒已写入 reminder，重复探测不会重复打扰用户。
+                "status": "unavailable",
                 "at_bj": iso_bj(now_bj),
                 "reminder_required": True,
                 "reminder": merged,
@@ -308,32 +340,53 @@ class Guard:
 
     def process_wewe_checks(self, state: dict, now_bj: dt.datetime) -> None:
         stages = state.setdefault("stages", {})
-        at_1330 = combine_bj(now_bj.date(), CHECK_1)
+
+        def resolved(entry: dict) -> bool:
+            # 旧版本曾在“提醒送达”时把不可用探测误标为 ok。兼容这类
+            # 已落盘状态：只有 healthy 的 ok 才能停止后续探测；shadow
+            # 则是显式的无通知演练模式，可视为完成。
+            return entry.get("status") == "shadow" or (
+                entry.get("status") == "ok"
+                and entry.get("probe", {}).get("status") == "healthy"
+            )
+
+        at_1100 = combine_bj(now_bj.date(), CHECK_1)
+        at_1200 = combine_bj(now_bj.date(), REFRESH_1)
         at_1430 = combine_bj(now_bj.date(), CHECK_2)
-        if now_bj < at_1330:
+        if now_bj < at_1100:
             return
-        if now_bj < at_1430:
-            entry = stages.get("wewe_check_1330", {})
-            if entry.get("status") not in {"ok", "shadow"}:
+        if now_bj < at_1200:
+            entry = stages.get("wewe_check_1100", {})
+            if not resolved(entry):
                 self.reminder(
                     state,
-                    "wewe_check_1330",
-                    self.probe_wewe(),
+                    "wewe_check_1100",
+                    self.probe_wewe(state, refresh_mode="single"),
                     now_bj,
-                    catchup=now_bj > at_1330 + dt.timedelta(minutes=3),
+                    catchup=now_bj > at_1100 + dt.timedelta(minutes=3),
                 )
             return
 
-        first = stages.get("wewe_check_1330")
-        second = stages.get("wewe_check_1430", {})
-        if second.get("status") in {"ok", "shadow"}:
+        refresh = stages.get("wewe_refresh_1200", {})
+        if not resolved(refresh):
+            self.reminder(
+                state,
+                "wewe_refresh_1200",
+                self.probe_wewe(state, refresh_mode="all"),
+                now_bj,
+                catchup=now_bj > at_1200 + dt.timedelta(minutes=3),
+            )
+        if now_bj < at_1430:
             return
-        probe = self.probe_wewe()
-        if not first:
-            stages["wewe_check_1330"] = {
+        final = stages.get("wewe_check_1430", {})
+        if resolved(final):
+            return
+        probe = self.probe_wewe(state, refresh_mode="all")
+        if not stages.get("wewe_check_1100"):
+            stages["wewe_check_1100"] = {
                 "status": "missed",
                 "at_bj": iso_bj(now_bj),
-                "reason": "device or guard was unavailable at 13:30",
+                "reason": "device or guard was unavailable at 11:00",
             }
             self.reminder(state, "wewe_check_1430", probe, now_bj, catchup=True)
         else:
@@ -345,7 +398,7 @@ class Guard:
             return
         probe = (
             state.get("stages", {}).get("wewe_check_1430", {}).get("probe")
-            or self.probe_wewe()
+            or self.probe_wewe(state)
         )
         excluded = probe.get("status") in {"auth_required", "service_down"}
         output_dir = self.data_root / "日报状态" / "prefetch"
@@ -355,6 +408,7 @@ class Guard:
         env.update(
             {
                 "RIBAO_TRUSTED_UTC": now_utc.isoformat(),
+                "RIBAO_TARGET_YMD": state["target_ymd"],
                 "RIBAO_EXCLUDE_WEWE": "1" if excluded else "0",
                 "RIBAO_PROJECT_ROOT": str(self.root),
                 "RIBAO_DATA_ROOT": str(self.data_root),
@@ -414,12 +468,16 @@ class Guard:
             return True
 
     def freeze_wewe_at_window_close(self, state: dict, now_bj: dt.datetime) -> dict:
-        """Freeze the 15:00 WeWe decision for every later retry that day."""
+        """Freeze the final WeWe decision for every later retry that day."""
         frozen = state.get("wewe_at_window_close")
         if frozen:
             return frozen
-        probe = self.probe_wewe()
-        exclude_wewe = probe.get("status") in {"auth_required", "service_down"}
+        # 14:30 已完成当天最后一次全量更新。15:00 仅冻结该结果；设备在
+        # 14:30 不可用时才以一次兜底探测代替，避免常规情况下重复刷新。
+        probe = state.get("stages", {}).get("wewe_check_1430", {}).get("probe")
+        if not isinstance(probe, dict):
+            probe = self.probe_wewe(state, refresh_mode="all")
+        exclude_wewe = probe.get("status") in {"auth_required", "service_down", "stale"}
         frozen = {
             "status": probe.get("status"),
             "reason": probe.get("reason", ""),
@@ -540,7 +598,11 @@ class Guard:
             time.sleep(2)
 
         final_manifest = load_json(self.data_root / "日报状态" / f"run-manifest-{state['target_ymd']}.json")
-        sent = final_manifest.get("final") == "sent"
+        final_state = final_manifest.get("final")
+        # 群投递模式成功终态为 sent；doc-only / 索引文档模式成功终态为
+        # generated。两者都代表当天日报已完成交付，不能在 15:30 后继续
+        # 触发失败告警或重试。
+        sent = final_state in {"sent", "generated"}
         finish_bj = now_bj + dt.timedelta(seconds=max(0, time.monotonic() - run_started_mono))
         next_retry = "" if sent else iso_bj(finish_bj + DAILY_RETRY_BACKOFF)
         self.mark_stage(

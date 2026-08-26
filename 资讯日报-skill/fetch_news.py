@@ -199,7 +199,7 @@ def parse_history_report(path):
 
 EN_ENTITY_STOPWORDS = {
     "business insider", "sensor tower", "pocketgamer", "pocketgamer biz",
-    "techcrunch", "reuters", "bloomberg", "white whale", "google play",
+    "techcrunch", "reuters", "bloomberg", "white whale", "gamelook", "google play",
     "app store", "wechat", "wewe rss", "it", "ai", "the", "series",
     "公司", "产品", "游戏", "应用", "平台", "本轮", "近日", "日前",
     "今日", "昨日", "本周", "下周", "今年", "去年", "上半年", "下半年",
@@ -231,6 +231,12 @@ def extract_entities(title, text):
 
     hay = f"{title or ''} {(text or '')[:800]}"
     for raw in re.findall(r"\b[A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,3}\b", hay):
+        if raw.lower() not in EN_ENTITY_STOPWORDS:
+            add(raw)
+    # 中文标题常把英文公司名与“确认/收购/融资”等汉字直接连写，Unicode
+    # 词边界不会在这里断开。补抽单个英文主体，保证 Stripe确认、OpenRouter获批
+    # 这类写法仍能进入事件级去重。
+    for raw in re.findall(r"(?<![A-Za-z])([A-Z][A-Za-z0-9&.\-]*)", hay):
         if raw.lower() not in EN_ENTITY_STOPWORDS:
             add(raw)
     for pat in (
@@ -329,6 +335,9 @@ EVENT_TERM_PATTERNS = {
     "price": r"涨价|降价|价格|price",
     "partnership": r"合作|联动|合同|partner|deal|contract",
     "layoff": r"裁员|重组|layoff|restructur",
+    # 并购和融资一样属于可长期复用的事件；不同媒体的“传闻/确认”稿不能
+    # 因 URL 不同而绕过跨日报去重。
+    "acquisition": r"收购|并购|购得|acquir(?:e|es|ed|ing)|buy(?:s|ing)?",
 }
 
 
@@ -339,11 +348,26 @@ def extract_event_terms(text):
 def has_new_progress_signal(current_text, history_text):
     current = current_text or ""
     history = history_text or ""
-    if re.search(r"新投资方|新增投资方|金额上调|估值上调|交易条款|新合同|签约|交付|发射|获批|正式上线|正式发布", current, flags=re.I):
+    # “未披露交易价格/条款”不是进展，不能把确认稿降级后放行。
+    undisclosed_terms = re.search(
+        r"(?:未|没有).{0,5}(?:披露|公布|公开|说明).{0,16}(?:交易金额|交易价格|对价|条款)|"
+        r"(?:交易金额|交易价格|对价|条款).{0,16}(?:未|没有).{0,5}(?:披露|公布|公开|说明)|"
+        r"(?:price|terms|consideration).{0,24}(?:not disclosed|undisclosed)",
+        current,
+        flags=re.I,
+    )
+    if not undisclosed_terms and re.search(
+        r"新投资方|新增投资方|金额上调|估值上调|交割完成|完成交割|监管批准|反垄断批准|获批|"
+        r"披露.{0,12}(?:交易金额|交易价格|对价|新条款)|(?:交易金额|交易价格|对价|新条款).{0,12}披露|"
+        r"新合同|签约|交付|发射|正式上线|正式发布|closing completed|regulatory approval|"
+        r"antitrust approval|disclosed.{0,24}(?:price|terms|consideration)|(?:price|terms|consideration).{0,24}disclosed",
+        current,
+        flags=re.I,
+    ):
         return True
-    formal = re.search(r"官宣|官方确认|正式宣布|正式确认|confirmed|officially|closed", current, flags=re.I)
-    rumor = re.search(r"传闻|洽谈|据.*报道|消息称|知情人士|reportedly|in talks|plans to|seeks", history, flags=re.I)
-    return bool(formal and rumor)
+    # 单纯从“据报”变成“确认”并不等于新事件。只有同时给出可验证的
+    # 实质差异（上面的金额、条款、交割、监管等）才放行。
+    return False
 
 
 def event_features(title, summary, links, path=""):
@@ -392,6 +416,17 @@ def old_news_match(current, history):
     shared_terms = current["terms"] & history["terms"]
     downgrade = has_new_progress_signal(current["text"], history["text"])
 
+    # 并购在背景里经常带有融资轮次；优先按并购事件判断，不能被背景融资
+    # 信息错误降级为“融资的新进展”。
+    if "acquisition" in shared_terms and shared_money:
+        level = "soft" if downgrade else "hard"
+        return {
+            "level": level,
+            "reason": "并购事件主体、交易金额与事件类型和历史成稿一致"
+            + ("；当前文本含实质新进展信号，降为软复核" if downgrade else ""),
+            "shared": sorted(shared_entities | shared_money | {"acquisition"}),
+        }
+
     if current["is_funding"] and history["is_funding"] and shared_money:
         if shared_rounds or shared_investors:
             reason_bits = ["融资事件主体、金额"]
@@ -413,12 +448,15 @@ def old_news_match(current, history):
             }
 
     milestone_terms = {"sales", "revenue", "download", "price", "partnership", "layoff", "launch"}
-    if shared_numbers and shared_terms & milestone_terms:
+    # 百分比（例如平台抽成 30%）在不同事件里过于常见，不能单独作为跨日报
+    # 同事件的核心数字；否则会产生无关新闻误拦截。
+    shared_material_numbers = {n for n in shared_numbers if not n.endswith("%")}
+    if shared_material_numbers and shared_terms & milestone_terms:
         level = "soft" if downgrade else "hard"
         return {
             "level": level,
             "reason": "主体、核心数字和事件类型与历史成稿一致" + ("；当前文本含新进展信号，降为软复核" if downgrade else ""),
-            "shared": sorted(shared_entities | shared_numbers | shared_terms),
+            "shared": sorted(shared_entities | shared_material_numbers | shared_terms),
         }
     if (shared_money or shared_rounds or shared_numbers) and shared_terms:
         return {
@@ -1263,18 +1301,42 @@ def _text_from_html(html):
     return " ".join(out)
 
 
-def fetch_article_full(url):
-    """取文章页 → 返回 (正文文本, 候选图URL列表, 发布时间UTC)。"""
+def extract_title_from_html(html):
+    if not html:
+        return ""
+    title_keys = {"og:title", "twitter:title"}
+    for tag in re.findall(r"<meta\b[^>]*>", html, re.I | re.S):
+        attrs = _html_attrs(tag)
+        key = (attrs.get("property") or attrs.get("name") or "").lower()
+        if key in title_keys and attrs.get("content"):
+            return clean(attrs["content"], 220)
+    m = re.search(r"<h1\b[^>]*>(.*?)</h1>", html, re.I | re.S)
+    if m:
+        return clean(m.group(1), 220)
+    m = re.search(r"<title\b[^>]*>(.*?)</title>", html, re.I | re.S)
+    if m:
+        return clean(re.split(r"\s+[-|]\s+", m.group(1), 1)[0], 220)
+    return ""
+
+
+def fetch_article_details(url):
     h = _download_html(url)
     if not h:
-        return "", [], None
+        return "", "", [], None
+    title = extract_title_from_html(h)
     body = _text_from_html(h)
     imgs = extract_images_from_html(h, base_url=url)
     if is_strategic_ai_game_text(url + " " + body + " " + h[:4000]):
         play_imgs = extract_play_store_screenshots_from_html(h)
         if play_imgs:
             imgs = play_imgs + [u for u in imgs if u not in play_imgs]
-    return body, imgs, extract_published_utc_from_html(h)
+    return title, body, imgs, extract_published_utc_from_html(h)
+
+
+def fetch_article_full(url):
+    """取文章页 → 返回 (正文文本, 候选图URL列表, 发布时间UTC)。"""
+    _, body, imgs, published = fetch_article_details(url)
+    return body, imgs, published
 
 
 def fetch_article(url):
@@ -1317,6 +1379,37 @@ def parse_listpage(base, pages, link_pattern, srcname):
     return out
 
 
+def parse_sitemap(sitemaps, link_pattern, srcname):
+    """抓 sitemap URL，按 loc/lastmod 生成候选；适合无 RSS 但 sitemap 标准的公开站。"""
+    import urllib.request
+
+    if isinstance(sitemaps, str):
+        sitemaps = [sitemaps]
+    out, seen = [], set()
+    pattern = re.compile(link_pattern) if link_pattern else None
+    for sitemap in sitemaps or []:
+        try:
+            req = urllib.request.Request(sitemap, headers={"User-Agent": "Mozilla/5.0"})
+            xml = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
+        except Exception:
+            continue
+        for block in re.findall(r"<url\b[^>]*>(.*?)</url>", xml, re.I | re.S):
+            loc = _rss_cdata_or_text(block, "loc")
+            if not loc or loc in seen:
+                continue
+            if pattern and not pattern.search(loc):
+                continue
+            lastmod = _rss_cdata_or_text(block, "lastmod")
+            published = _parse_datetime_utc(lastmod, assume_bj=False) if lastmod else None
+            slug = loc.rstrip("/").rsplit("/", 1)[-1].replace("-", " ")
+            seen.add(loc)
+            item = {"title": clean(slug, 200), "summary": "", "link": loc, "src": srcname}
+            if published:
+                item["_published_utc"] = published
+            out.append(item)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=int, default=None, help="覆盖时间窗为近N小时（测试用）")
@@ -1349,7 +1442,7 @@ def main():
         return
 
     cfg = yaml.safe_load(open(SOURCES, encoding="utf-8"))
-    base = cfg["config"]["rsshub_base"]
+    base = os.getenv("RIBAO_RSSHUB_BASE", cfg["config"]["rsshub_base"]).rstrip("/")
     kw = cfg.get("keywords", {})
     include = kw.get("include", [])
     exclude = kw.get("exclude", [])
@@ -1522,6 +1615,57 @@ def main():
                             add(child)
                         continue
                     add(it)
+            except Exception as ex:
+                errors.append(f"{name}: {ex}")
+            continue
+
+        if typ == "sitemap":
+            try:
+                items = parse_sitemap(src.get("sitemaps") or src.get("url"),
+                                      src.get("link_pattern", ""), name)
+                fetched = 0
+                body_limit = src.get("body_limit", 12)
+                body_chars = src.get("body_chars", 900)
+                for it in items[:src.get("item_limit", 30)]:
+                    published = it.get("_published_utc")
+                    if published:
+                        if not (start_utc <= published < end_utc):
+                            continue
+                        it["published_utc"] = published.isoformat(timespec="seconds")
+                        it["published_bj"] = bj_time_label(published)
+                        it["undated"] = False
+                    elif args.date and not args.include_undated:
+                        continue
+                    else:
+                        it["undated"] = True
+                    if src.get("fetch_body") and it.get("link") and fetched < body_limit:
+                        title, body, imgs, page_published = fetch_article_details(it["link"])
+                        if page_published and not (start_utc <= page_published < end_utc):
+                            continue
+                        if page_published:
+                            it["published_utc"] = page_published.isoformat(timespec="seconds")
+                            it["published_bj"] = bj_time_label(page_published)
+                            it["undated"] = False
+                        if title:
+                            it["title"] = title
+                        if body:
+                            it["summary"] = clean(body, body_chars)
+                        if imgs:
+                            it["images"] = imgs
+                        fetched += 1
+                    text_for_filter = it["title"] + " " + it.get("summary", "")
+                    if not hit_keywords(text_for_filter, include, exclude, protect):
+                        continue
+                    if is_personal_lifestyle_noise(text_for_filter):
+                        continue
+                    if is_low_info_title_only(it["title"], it.get("summary", "")):
+                        continue
+                    if is_commodity_gaming_hardware_launch(text_for_filter):
+                        continue
+                    if src.get("autoclassify"):
+                        add(it)
+                    else:
+                        add(it, board, track)
             except Exception as ex:
                 errors.append(f"{name}: {ex}")
             continue

@@ -9,4 +9,5 @@ if [ -f "$GUARD_ENV" ]; then
   . "$GUARD_ENV"
   set +a
 fi
-exec /usr/bin/python3 "$RUNTIME_DIR/ribao_guard.py" "$@"
+PYTHON_BIN="${RIBAO_PYTHON_BIN:-python3}"
+exec "$PYTHON_BIN" "$RUNTIME_DIR/ribao_guard.py" "$@"

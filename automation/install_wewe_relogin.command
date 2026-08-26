@@ -15,6 +15,7 @@ set -a
 # shellcheck disable=SC1090
 . "$CONFIG_FILE"
 set +a
+PYTHON_BIN="${RIBAO_PYTHON_BIN:-python3}"
 
 if [ -z "${WEWE_AUTH_CODE:-}" ]; then
   echo "Set WEWE_AUTH_CODE in config.env before installing the relogin service." >&2
@@ -24,8 +25,8 @@ command -v cloudflared >/dev/null 2>&1 || {
   echo "cloudflared is required. Install it, then rerun this installer." >&2
   exit 1
 }
-/usr/bin/python3 -c 'import qrcode, qrcode.image.svg' >/dev/null 2>&1 || {
-  echo "Python package qrcode is required: python3 -m pip install --user qrcode" >&2
+"$PYTHON_BIN" -c 'import qrcode, qrcode.image.svg' >/dev/null 2>&1 || {
+  echo "Python package qrcode is required: $PYTHON_BIN -m pip install qrcode" >&2
   exit 1
 }
 
@@ -51,12 +52,12 @@ chmod 755 "$APP_DIR/wewe_relogin_server.py"
 } > "$APP_DIR/relogin.env"
 chmod 600 "$APP_DIR/relogin.env"
 
-/usr/bin/python3 - "$PLIST_DST" "$LABEL" "$APP_DIR" "$PATH" <<'PY'
+"$PYTHON_BIN" - "$PLIST_DST" "$LABEL" "$APP_DIR" "$PATH" "$PYTHON_BIN" <<'PY'
 import plistlib, sys
-output, label, app_dir, path = sys.argv[1:]
+output, label, app_dir, path, py_bin = sys.argv[1:]
 payload = {
     "Label": label,
-    "ProgramArguments": ["/usr/bin/env", "python3", f"{app_dir}/wewe_relogin_server.py"],
+    "ProgramArguments": [py_bin, f"{app_dir}/wewe_relogin_server.py"],
     "EnvironmentVariables": {
         "PATH": path,
         "LANG": "en_US.UTF-8",

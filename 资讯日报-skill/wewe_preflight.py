@@ -34,6 +34,8 @@ ENABLE_NOTIFY = os.getenv("WEWE_ENABLE_NOTIFY", "1") != "0"
 STALE_LEVEL = os.getenv("WEWE_STALE_LEVEL", "WARN").strip().upper()
 ALL_FEED_URL = os.getenv("WEWE_ALL_FEED_URL", f"{BASE_URL}/feeds/all.rss")
 RSS_READ_LIMIT_BYTES = int(os.getenv("WEWE_RSS_READ_LIMIT_BYTES", str(120 * 1024 * 1024)))
+REFRESH_FEEDS = os.getenv("WEWE_REFRESH_FEEDS", "1") != "0"
+REFRESH_MODE = os.getenv("WEWE_REFRESH_MODE", "all").strip().lower()
 
 
 def _load_env_file(path):
@@ -107,6 +109,8 @@ RELOGIN_API = os.getenv("RELOGIN_API_URL") or (
 RELOGIN_ADMIN_TOKEN = os.getenv("RELOGIN_ADMIN_TOKEN") or _RELOGIN_ENV.get(
     "RELOGIN_ADMIN_TOKEN", ""
 )
+RELOGIN_TOKEN = os.getenv("RELOGIN_TOKEN") or _RELOGIN_ENV.get("RELOGIN_TOKEN", "")
+RELOGIN_PORT = _RELOGIN_ENV.get("RELOGIN_PORT", "4001")
 
 
 def _relogin_api(path, timeout):
@@ -154,6 +158,27 @@ def remote_scan_line():
         f"📱 不在电脑旁：找任意一台电脑/平板打开 {url} ，"
         "页面自动出码，用手机微信扫一扫即可（登录恢复后链接自动失效）。\n"
     )
+
+
+def relogin_local_url():
+    if not RELOGIN_TOKEN:
+        return ""
+    return f"http://127.0.0.1:{RELOGIN_PORT}/r/{RELOGIN_TOKEN}"
+
+
+def open_relogin_page():
+    """Open the local "add WeRead account" QR page when an auth alert fires."""
+    if not OPEN_DASH:
+        return
+    url = relogin_local_url()
+    if not url:
+        log("WeWe RSS: 缺少 RELOGIN_TOKEN，无法自动打开本机扫码页")
+        return
+    try:
+        subprocess.run(["open", url], check=False, timeout=10)
+        log("WeWe RSS: 已自动打开本机扫码页")
+    except Exception as exc:
+        log(f"WeWe RSS: opening relogin page failed: {exc}")
 
 
 def feishu_push(title, message, critical=False):
@@ -354,15 +379,17 @@ def alert_login_required(reason, first_alert=False):
     title = "WeWe RSS 需要重新登录"
     remote_line = remote_scan_line() if first_alert else ""
     message = (
-        "日报任务已暂停。请在 WeWe RSS 后台的账号管理里重新扫码登录微信读书。\n\n"
-        f"后台地址：{DASH_URL}\n"
+        "日报任务已暂停。旧读书账号的 token 已不可用；不要只点“启用”旧账号。\n"
+        "请使用自动打开的新增账号二维码，用手机微信扫一扫重新添加读书账号。\n\n"
+        f"若未自动弹出二维码，可打开本机扫码页：{relogin_local_url() or '本机扫码页未配置'}\n"
+        f"后台仅用于核对状态：{DASH_URL}\n"
         + remote_line
         + f"检测结果：{reason}\n\n"
-        "扫码完成后不用重新运行任务，我会自动继续检查，通过后再生成当日日报。"
+        "扫码完成后不用重新运行任务；系统会继续检查账号、刷新公众号源，并在可用后继续生成当日日报。"
     )
     notify(title, message)
     if first_alert:
-        open_dashboard()
+        open_relogin_page()
         feishu_push("⚠️ WeWe RSS 需要重新登录", message, critical=True)
     if SHOW_DIALOG:
         script = (
@@ -473,8 +500,29 @@ def re_findall_pubdates(xml):
     )
 
 
+def _parse_target_ymd(value):
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return None
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
 def current_bj_window():
-    """与 fetch_news.py 保持一致：北京时间前日15:00至当日15:00。"""
+    """与 fetch_news.py 保持一致：目标日报日的前日15:00至当日15:00。
+
+    11:00/12:00/14:30 的守门器检查也必须检查“今天 15:00 即将关闭的日报窗口”，
+    不能因为当前时间还早于 15:00 就回退到上一天窗口。
+    """
+    target_day = _parse_target_ymd(os.getenv("RIBAO_TARGET_YMD") or os.getenv("WEWE_TARGET_YMD"))
+    if target_day:
+        end_bj = dt.datetime.combine(target_day, dt.time(15, 0))
+        return end_bj - dt.timedelta(days=1), end_bj
+
     trusted = os.getenv("RIBAO_TRUSTED_UTC", "").strip()
     if trusted:
         try:
@@ -566,9 +614,13 @@ def check_once():
     if not feeds:
         raise WeweError("WeWe RSS 没有启用的公众号源，请先订阅公众号")
 
-    refreshed, refresh_failed = refresh_feeds(feeds)
-    if refresh_failed:
-        raise WeweError("WeWe RSS 刷新失败：" + "；".join(refresh_failed[:5]))
+    if REFRESH_FEEDS:
+        selected_feeds = feeds[:1] if REFRESH_MODE == "single" else feeds
+        refreshed, refresh_failed = refresh_feeds(selected_feeds)
+        if refresh_failed:
+            raise WeweError("WeWe RSS 刷新失败：" + "；".join(refresh_failed[:5]))
+    else:
+        refreshed = [feed_name(feed) for feed in feeds]
 
     # Re-read accounts because a 401 probe changes status to INVALID in WeWe RSS.
     account_data = query("/trpc/account.list", {"limit": 1000}, timeout=20)
@@ -596,7 +648,8 @@ def check_once():
     names = "、".join(account.get("name") or account.get("id") for account in enabled_accounts)
     source_names = "、".join(refreshed[:8]) + (f" 等 {len(refreshed)} 个源" if len(refreshed) > 8 else "")
     status = "WARN" if stale_warning else "正常"
-    return f"WeWe RSS {status}：账号 {names}；已刷新 {len(refreshed)} 个源（{source_names}）；{freshness}"
+    action = "已验证并刷新" if REFRESH_MODE == "single" else ("已刷新" if REFRESH_FEEDS else "已检查")
+    return f"WeWe RSS {status}：账号 {names}；{action} {len(refreshed)} 个源（{source_names}）；{freshness}"
 
 
 def probe_health():
@@ -631,29 +684,73 @@ def send_fixed_guard_reminder(
     show_dialog=True,
     catchup=False,
 ):
-    """Send the mandatory 13:30/14:30 login reminder on requested channels."""
-    if stage not in {"1330", "1430"}:
+    """Send the mandatory 11:00/12:00/14:30 WeWe alert on requested channels."""
+    if stage not in {"1100", "1200", "1430"}:
         raise ValueError(f"unsupported fixed reminder stage: {stage}")
-    title = "WeWe RSS 需要重新登录"
-    remote_url = request_remote_scan_url()
+    login_signals = (
+        "暂无可用微信读书账号",
+        "没有微信读书账号",
+        "无可用读书账号",
+        "账号失效",
+        "401",
+        "Unauthorized",
+        "UNAUTHORIZED",
+    )
+    needs_login = any(signal in reason for signal in login_signals)
+    title = "WeWe RSS 需要重新登录" if needs_login else "WeWe RSS 全文源不可用"
+    remote_url = request_remote_scan_url() if needs_login else ""
     delayed = "（延迟补提醒）" if catchup else ""
-    stage_label = "13:30 首次提醒" if stage == "1330" else "14:30 未恢复提醒"
-    message = (
-        f"固定工作流 {stage_label}{delayed}：微信读书账号当前不可用。\n"
-        f"请打开公网扫码页重新登录：{remote_url or '公网扫码链接生成失败，系统会继续重试'}\n"
-        f"本机后台：{DASH_URL}\n"
-        f"检测结果：{reason}\n"
-        "WeWe 仅为增强信息源；若北京时间 15:00 前仍未恢复，日报会排除 WeWe，继续使用其他渠道生成正式版。"
+    stage_label = {
+        "1100": "11:00 登录验证",
+        "1200": "12:00 自动刷新失败",
+        "1430": "14:30 最后一次自动刷新失败",
+    }[stage]
+    if needs_login and show_dialog:
+        # The guard wakes every 30s. Only open the local QR page together with
+        # the first local dialog for a reminder stage; otherwise a missing IM
+        # chat_id or transient send failure can spawn dozens of tabs.
+        open_relogin_page()
+        action = (
+            "旧读书账号 token 已不可用；不要只点“启用”旧账号。"
+            f"请使用已自动打开的新增账号二维码扫码登录；不在电脑旁时打开公网扫码页："
+            f"{remote_url or '公网扫码链接生成失败，系统会继续重试'}"
+        )
+    else:
+        action = (
+            "当前更像是 WeWe RSS 服务或 mp.weixin.qq.com 全文抓取链路不可用，"
+            "不是微信读书账号失效；请先查看本机 WeWe 后台与容器日志，不需要立即扫码重登。"
+        )
+    message = "\n".join(
+        [
+            f"固定工作流 {stage_label}{delayed}：{title}。",
+            action,
+            f"本机扫码页：{relogin_local_url() or '本机扫码页未配置'}",
+            f"后台仅用于核对状态：{DASH_URL}",
+            f"检测结果：{reason}",
+            "WeWe 仅为增强信息源；若北京时间 15:00 前仍未恢复，日报会排除 WeWe，继续使用其他渠道生成正式版。",
+        ]
     )
     feishu_result = {"verified": True, "skipped": True}
     if send_feishu:
-        if remote_url:
+        if not FEISHU_CHAT_ID:
+            # Current local-only mode writes the report link to the Feishu index
+            # doc and intentionally leaves the report chat unset. A missing chat
+            # must not make the fixed reminder stage fail and repeat forever.
+            feishu_result = {"verified": True, "skipped": True, "error": "missing Feishu chat_id"}
+        elif needs_login and remote_url:
             feishu_result = feishu_push_verified(
                 f"⚠️ {title}（{stage_label}）",
                 message,
                 f"ribao-{target_ymd}-wewe-login-{stage}",
                 remote_url,
             )
+        elif not needs_login:
+            sent = feishu_push(
+                f"⚠️ {title}（{stage_label}）",
+                message,
+                critical=False,
+            )
+            feishu_result = {"verified": bool(sent) or not FEISHU_CHAT_ID, "skipped": not FEISHU_CHAT_ID}
         else:
             feishu_result = {"verified": False, "error": "public relogin URL unavailable"}
     dialog_result = {"started": True, "skipped": True}
@@ -675,7 +772,7 @@ def precheck_once():
     """日报执行前的轻量预检：只查一次，失效就推飞书并打开后台，不阻塞、不轮询。
 
     退出码：0=正常；3=账号失效需重登；4=无法连接 WeWe RSS。
-    兼容旧的手动单次预检；正式定时提醒由北京时间守门器在 13:30/14:30 固定执行。
+    兼容旧的手动单次预检；正式定时动作由北京时间守门器在 11:00/12:00/14:30 固定执行。
     """
     log("WeWe RSS 预检（单次，日报前）：检查账号 token、刷新全部启用源并校验 all.rss 新鲜度 ...")
     try:
@@ -692,12 +789,14 @@ def precheck_once():
         reason = str(exc)
         log(f"WeWe RSS unavailable: {reason}")
         notify("WeWe RSS 需要重新登录", reason)
-        open_dashboard()
+        open_relogin_page()
         remote_line = remote_scan_line()
         sent = feishu_push(
             "⚠️ WeWe RSS 需要重新登录（日报前预检）",
-            "微信读书账号已失效；若北京时间 15:00 前未恢复，今天的正式日报会排除 WeWe 并继续生成。\n"
-            f"请尽快到后台扫码重登：{DASH_URL}\n"
+            "微信读书账号已失效；不要只点“启用”旧账号，请用新增账号二维码重新扫码登录。\n"
+            "若北京时间 15:00 前未恢复，今天的正式日报会排除 WeWe 并继续生成。\n"
+            f"本机扫码页：{relogin_local_url() or '本机扫码页未配置'}\n"
+            f"后台仅用于核对状态：{DASH_URL}\n"
             + remote_line
             + f"检测结果：{reason}\n"
             "（重登后无需手动操作；守门器会在 15:00 做最终判断。）",

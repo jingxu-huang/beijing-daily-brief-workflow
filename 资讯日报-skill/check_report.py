@@ -13,6 +13,8 @@ import os
 import re
 import sys
 
+import fetch_news
+
 
 BAD_BODY_PHRASES = [
     "该条来自",
@@ -249,6 +251,19 @@ def is_low_substance_report_item(title, body_text):
     return len(compact) < 140
 
 
+def has_source_annotation(body_text):
+    """正文最后一个信息点需要形如 `（IT之家）` 的来源名括注。"""
+    lines = [
+        line.strip()
+        for line in (body_text or "").splitlines()
+        if line.strip() and not line.strip().startswith(("http://", "https://", "![](", "|"))
+    ]
+    if not lines:
+        return False
+    tail = lines[-1]
+    return bool(re.search(r"（[^）]{1,40}）\s*$", tail))
+
+
 def is_theme_excluded(text):
     return (
         _match_any(text, EXCLUDED_DIRECTION_PATTERNS)
@@ -311,20 +326,27 @@ def parse_report(text):
     current = None
     for raw in text.splitlines():
         line = raw.rstrip()
+        if re.match(r"^\s*<!--\s*QA_SKIP\b", line, flags=re.I):
+            continue
         m = re.match(r"^###\s+\d+）(.+)$", line)
         if m:
             if current:
                 items.append(current)
-            current = {"title": m.group(1).strip(), "body": [], "link": ""}
+            current = {"title": m.group(1).strip(), "body": [], "link": "", "links": []}
             continue
         if not current:
             continue
         s = line.strip()
+        if s == "<br>" or re.match(r"^#{1,2}\s+", s):
+            items.append(current)
+            current = None
+            continue
         if s == "---" or s == "Source 来源：":
             items.append(current)
             current = None
             continue
         if s.startswith("http://") or s.startswith("https://"):
+            current["links"].append(normalize_url(s))
             if not current["link"]:
                 current["link"] = normalize_url(s)
         elif not s.startswith("![]("):
@@ -334,6 +356,47 @@ def parse_report(text):
     for it in items:
         it["body_text"] = "\n".join(it["body"]).strip()
     return items
+
+
+def infer_target_ymd(draft_path):
+    """从草稿文件名取得日报日期，避免把当天成稿计入历史。"""
+    m = re.search(r"资讯日报-草稿-(\d{8})\.md$", os.path.basename(draft_path or ""))
+    return m.group(1) if m else ""
+
+
+def final_report_history_hits(report_items, target_ymd):
+    """成稿也必须过事件门禁，覆盖备选或人工补充的链接。"""
+    if not target_ymd:
+        return []
+    history, _ = fetch_news.load_event_history(target_ymd)
+    hits = []
+    for item in report_items:
+        current = fetch_news.event_features(
+            item.get("title", ""),
+            item.get("body_text", ""),
+            item.get("links") or [item.get("link", "")],
+        )
+        soft = None
+        for previous in history:
+            matched = fetch_news.old_news_match(current, previous)
+            if not matched:
+                continue
+            record = {
+                "level": matched["level"],
+                "title": item.get("title", ""),
+                "history_title": previous.get("title", ""),
+                "history_path": previous.get("path", ""),
+                "reason": matched.get("reason", ""),
+            }
+            if matched["level"] == "hard":
+                hits.append(record)
+                break
+            if soft is None:
+                soft = record
+        else:
+            if soft:
+                hits.append(soft)
+    return hits
 
 
 def parse_old_news_audit(text):
@@ -384,7 +447,7 @@ def parse_qa_skip_links(text):
     """读取成稿中的显式剔除链接：<!-- QA_SKIP https://... -->。"""
     links = []
     for m in re.finditer(r"<!--\s*QA_SKIP\b(.*?)-->", text or "", flags=re.I | re.S):
-        links.extend(re.findall(r"https?://[^\s<>]+", m.group(1)))
+        links.extend(re.findall(r"https?://[^\s<>\"']+", m.group(1)))
     return {normalize_url(u) for u in links}
 
 
@@ -444,6 +507,7 @@ def main():
     draft_items = parse_draft(draft_text)
     report_items = parse_report(report_text)
     old_news_mode, old_news_items = parse_old_news_audit(draft_text)
+    target_ymd = infer_target_ymd(args.draft)
     draft_by_link = {it["link"]: it for it in draft_items}
     qa_skip_links = parse_qa_skip_links(report_text)
     report_text_for_coverage = re.sub(
@@ -511,6 +575,28 @@ def main():
     elif old_news_items:
         ok.append("草稿旧闻复核命中项未被成稿采用。")
 
+    # 不能只相信草稿候选区：成稿里从备选池或人工补充进来的条目，同样
+    # 必须与前 45 天正式日报比对。硬命中直接阻断发布。
+    final_history_hits = final_report_history_hits(report_items, target_ymd)
+    final_hard_hits = [it for it in final_history_hits if it["level"] == "hard"]
+    final_soft_hits = [it for it in final_history_hits if it["level"] == "soft"]
+    if final_hard_hits:
+        fail.append(
+            "成稿跨日报事件重复（含备选/手工补充），请删除或提供实质新进展："
+            + "；".join(
+                f"{it['title']} ← {it['history_title']}（{it['reason']}）"
+                for it in final_hard_hits[:8]
+            )
+        )
+    if final_soft_hits:
+        warn.append(
+            "成稿疑似跨日报同事件，需确认是否有新金额、条款、交割或监管进展："
+            + "；".join(
+                f"{it['title']} ← {it['history_title']}（{it['reason']}）"
+                for it in final_soft_hits[:8]
+            )
+        )
+
     low_substance_items = [
         it for it in report_items
         if is_low_substance_report_item(it["title"], it.get("body_text", ""))
@@ -520,6 +606,18 @@ def main():
             "重大/数据条目信息量过低，需补公司主体、业务和关键数据："
             + "；".join(it["title"] for it in low_substance_items[:8])
         )
+
+    missing_source_annotation = [
+        it for it in report_items
+        if not has_source_annotation(it.get("body_text", ""))
+    ]
+    if missing_source_annotation:
+        fail.append(
+            "条目正文末尾缺少来源名括注（如 `（IT之家）`，链接仍单独放底部）："
+            + "；".join(it["title"] for it in missing_source_annotation[:8])
+        )
+    else:
+        ok.append("每条正文末尾均包含来源名括注。")
 
     missing_items = [it for it in draft_items if it["link"] not in report_text_for_coverage]
     old_news_links = {normalize_url(it.get("link", "")) for it in old_news_items}

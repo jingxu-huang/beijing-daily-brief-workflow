@@ -21,7 +21,7 @@ Install the single macOS scheduler:
 bash automation/install_guard.command
 ```
 
-WeWe RSS is optional and never blocks the other sources after 15:00 BJT. Fixed login reminders occur at 13:30 and, if still unavailable, 14:30. At the 15:30 hard deadline the workflow alerts once, continues in the background, and sends only the complete QC-approved report later.
+WeWe RSS is optional and never blocks the other sources after 15:00 BJT. It validates the live login at 11:00, performs full refreshes at 12:00 and 14:30, and alerts immediately if either operation finds an invalid account. At the 15:30 hard deadline the workflow alerts once, continues in the background, and sends only the complete QC-approved report later.
 
 Run all local checks before publishing:
 
