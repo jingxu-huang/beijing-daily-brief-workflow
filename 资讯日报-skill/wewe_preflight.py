@@ -66,6 +66,7 @@ def _cfg(key, default=""):
 
 # 飞书推送（复用 feishu-bot 的应用与日报群）。
 ENABLE_FEISHU = os.getenv("WEWE_FEISHU", "1") != "0"
+GROUP_MESSAGES_ENABLED = os.getenv("RIBAO_GROUP_MESSAGES", "1") != "0"
 # 账号失效属于关键告警：单独设置 WEWE_FEISHU=0 不得静默关闭。
 # 只有隔离测试同时显式设置此开关，才允许跳过掉线链接告警。
 ALLOW_SILENT_LOGIN_ALERT = os.getenv("WEWE_ALLOW_SILENT_LOGIN_ALERT", "0") == "1"
@@ -161,9 +162,34 @@ def remote_scan_line():
 
 
 def relogin_local_url():
-    if not RELOGIN_TOKEN:
-        return ""
-    return f"http://127.0.0.1:{RELOGIN_PORT}/r/{RELOGIN_TOKEN}"
+    """Return the local page that can add a fresh WeRead account.
+
+    The dedicated relogin service gives a purpose-built QR page when its
+    private token is configured.  Its absence must not turn a genuine login
+    alert into a dead end: WeWe's own account dashboard exposes the same
+    "add account" flow on this Mac.
+    """
+    if RELOGIN_TOKEN:
+        return f"http://127.0.0.1:{RELOGIN_PORT}/r/{RELOGIN_TOKEN}"
+    return DASH_URL
+
+
+def local_scan_page_notice():
+    """Safe user-facing text for the local QR page; never expose its token."""
+    if RELOGIN_TOKEN:
+        return "本机新增账号二维码页会自动打开（地址含私有令牌，勿复制或截图传播）"
+    return "专用二维码页未配置；账号失效时会自动打开 WeWe 新增账号后台页"
+
+
+def user_safe_reason(reason):
+    """Keep local dialogs useful without exposing feed names or raw transport data."""
+    if "status code 502" in reason or "HTTP 502" in reason:
+        count = reason.count("HTTP 500") or reason.count("status code 502")
+        suffix = f"（{count} 个刷新任务失败）" if count > 1 else ""
+        return f"WeWe 上游请求返回 502{suffix}；详细诊断已写入本机日志。"
+    if len(reason) > 240:
+        return "WeWe 检查失败；详细诊断已写入本机日志。"
+    return reason
 
 
 def open_relogin_page():
@@ -171,19 +197,19 @@ def open_relogin_page():
     if not OPEN_DASH:
         return
     url = relogin_local_url()
-    if not url:
-        log("WeWe RSS: 缺少 RELOGIN_TOKEN，无法自动打开本机扫码页")
-        return
     try:
         subprocess.run(["open", url], check=False, timeout=10)
-        log("WeWe RSS: 已自动打开本机扫码页")
+        if RELOGIN_TOKEN:
+            log("WeWe RSS: 已自动打开本机新增账号扫码页")
+        else:
+            log("WeWe RSS: 专用重登页未配置，已自动打开 WeWe 新增账号后台页")
     except Exception as exc:
         log(f"WeWe RSS: opening relogin page failed: {exc}")
 
 
 def feishu_push(title, message, critical=False):
     """用 lark-cli 给日报群发消息；关键告警返回是否实际发送成功。"""
-    enabled = ENABLE_FEISHU or (critical and not ALLOW_SILENT_LOGIN_ALERT)
+    enabled = GROUP_MESSAGES_ENABLED and (ENABLE_FEISHU or (critical and not ALLOW_SILENT_LOGIN_ALERT))
     if not enabled or not FEISHU_CHAT_ID:
         if critical:
             log("WeWe RSS: 关键飞书告警被显式测试开关关闭")
@@ -381,10 +407,10 @@ def alert_login_required(reason, first_alert=False):
     message = (
         "日报任务已暂停。旧读书账号的 token 已不可用；不要只点“启用”旧账号。\n"
         "请使用自动打开的新增账号二维码，用手机微信扫一扫重新添加读书账号。\n\n"
-        f"若未自动弹出二维码，可打开本机扫码页：{relogin_local_url() or '本机扫码页未配置'}\n"
+        f"{local_scan_page_notice()}\n"
         f"后台仅用于核对状态：{DASH_URL}\n"
         + remote_line
-        + f"检测结果：{reason}\n\n"
+        + f"检测结果：{user_safe_reason(reason)}\n\n"
         "扫码完成后不用重新运行任务；系统会继续检查账号、刷新公众号源，并在可用后继续生成当日日报。"
     )
     notify(title, message)
@@ -395,6 +421,40 @@ def alert_login_required(reason, first_alert=False):
         script = (
             f"display dialog {osa_quote(message)} "
             'buttons {"稍后提醒", "我已扫码"} default button "我已扫码" '
+            f"with title {osa_quote(title)} with icon caution giving up after 900"
+        )
+        run_osascript(script, timeout=920)
+
+
+def reason_requires_login(reason):
+    """Whether a WeWe failure is evidence that the account must be re-added."""
+    login_signals = (
+        "暂无可用微信读书账号",
+        "没有微信读书账号",
+        "无可用读书账号",
+        "账号失效",
+        "401",
+        "Unauthorized",
+        "UNAUTHORIZED",
+    )
+    return any(signal in reason for signal in login_signals)
+
+
+def alert_source_unavailable(reason):
+    """Report a transient WeWe/upstream failure without sending users to login."""
+    title = "WeWe RSS 全文源不可用"
+    message = (
+        "WeWe RSS 服务或 mp.weixin.qq.com 全文抓取链路暂时不可用，"
+        "当前没有账号失效证据，因此不会自动打开扫码页。\n\n"
+        f"后台仅用于核对状态：{DASH_URL}\n"
+        f"检测结果：{reason}\n\n"
+        "系统会按固定时点继续重试；15:00 前未恢复时，日报会排除 WeWe，继续使用其他公开源生成。"
+    )
+    notify(title, message)
+    if SHOW_DIALOG:
+        script = (
+            f"display dialog {osa_quote(message)} "
+            'buttons {"知道了"} default button "知道了" '
             f"with title {osa_quote(title)} with icon caution giving up after 900"
         )
         run_osascript(script, timeout=920)
@@ -662,17 +722,7 @@ def probe_health():
         return {"status": status, "reason": message}
     except WeweError as exc:
         reason = str(exc)
-        auth_signals = (
-            "暂无可用微信读书账号",
-            "没有微信读书账号",
-            "无可用读书账号",
-            "账号失效",
-            "账号：",
-            "401",
-            "Unauthorized",
-            "UNAUTHORIZED",
-        )
-        status = "auth_required" if any(signal in reason for signal in auth_signals) else "service_down"
+        status = "auth_required" if reason_requires_login(reason) else "service_down"
         return {"status": status, "reason": reason}
 
 
@@ -687,16 +737,8 @@ def send_fixed_guard_reminder(
     """Send the mandatory 11:00/12:00/14:30 WeWe alert on requested channels."""
     if stage not in {"1100", "1200", "1430"}:
         raise ValueError(f"unsupported fixed reminder stage: {stage}")
-    login_signals = (
-        "暂无可用微信读书账号",
-        "没有微信读书账号",
-        "无可用读书账号",
-        "账号失效",
-        "401",
-        "Unauthorized",
-        "UNAUTHORIZED",
-    )
-    needs_login = any(signal in reason for signal in login_signals)
+    send_feishu = send_feishu and GROUP_MESSAGES_ENABLED
+    needs_login = reason_requires_login(reason)
     title = "WeWe RSS 需要重新登录" if needs_login else "WeWe RSS 全文源不可用"
     remote_url = request_remote_scan_url() if needs_login else ""
     delayed = "（延迟补提醒）" if catchup else ""
@@ -724,9 +766,9 @@ def send_fixed_guard_reminder(
         [
             f"固定工作流 {stage_label}{delayed}：{title}。",
             action,
-            f"本机扫码页：{relogin_local_url() or '本机扫码页未配置'}",
+            local_scan_page_notice(),
             f"后台仅用于核对状态：{DASH_URL}",
-            f"检测结果：{reason}",
+            f"检测结果：{user_safe_reason(reason)}",
             "WeWe 仅为增强信息源；若北京时间 15:00 前仍未恢复，日报会排除 WeWe，继续使用其他渠道生成正式版。",
         ]
     )
@@ -788,6 +830,9 @@ def precheck_once():
     except WeweError as exc:
         reason = str(exc)
         log(f"WeWe RSS unavailable: {reason}")
+        if not reason_requires_login(reason):
+            alert_source_unavailable(reason)
+            return 4
         notify("WeWe RSS 需要重新登录", reason)
         open_relogin_page()
         remote_line = remote_scan_line()
@@ -795,17 +840,17 @@ def precheck_once():
             "⚠️ WeWe RSS 需要重新登录（日报前预检）",
             "微信读书账号已失效；不要只点“启用”旧账号，请用新增账号二维码重新扫码登录。\n"
             "若北京时间 15:00 前未恢复，今天的正式日报会排除 WeWe 并继续生成。\n"
-            f"本机扫码页：{relogin_local_url() or '本机扫码页未配置'}\n"
+            f"{local_scan_page_notice()}\n"
             f"后台仅用于核对状态：{DASH_URL}\n"
             + remote_line
-            + f"检测结果：{reason}\n"
+            + f"检测结果：{user_safe_reason(reason)}\n"
             "（重登后无需手动操作；守门器会在 15:00 做最终判断。）",
             critical=True,
         )
-        if not remote_line:
+        if GROUP_MESSAGES_ENABLED and not remote_line:
             log("WeWe RSS: CRITICAL：未能生成公网重登链接")
             return 5
-        if not sent:
+        if GROUP_MESSAGES_ENABLED and not sent:
             log("WeWe RSS: CRITICAL：公网重登链接未能发送到飞书")
             return 5
         # 连接不上 WeWe RSS 与账号失效区分一下退出码，便于排查。
@@ -848,7 +893,10 @@ def main():
             log(f"WeWe RSS unavailable: {reason}")
             now = time.time()
             if first_alert or now - last_alert >= NOTIFY_SECONDS:
-                alert_login_required(reason, first_alert=first_alert)
+                if reason_requires_login(reason):
+                    alert_login_required(reason, first_alert=first_alert)
+                else:
+                    alert_source_unavailable(reason)
                 last_alert = time.time()
                 first_alert = False
             time.sleep(max(5, POLL_SECONDS))

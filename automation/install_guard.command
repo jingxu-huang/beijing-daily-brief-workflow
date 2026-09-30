@@ -62,6 +62,10 @@ cp "$CONFIG_FILE" "$RUNTIME_DIR/guard.env"
   printf '\nRIBAO_PROJECT_ROOT=%q\n' "$ROOT_DIR"
   printf 'RIBAO_DATA_ROOT=%q\n' "$RIBAO_DATA_ROOT"
   printf 'RIBAO_CODEX_CONTROL_HOME=%q\n' "$CONTROL_HOME"
+  # WeWe RSS is retired from formal production.  Override any stale local
+  # config so the installed guard cannot revive its probes or QR reminders.
+  printf 'RIBAO_WEWE_RETIRED=1\n'
+  printf 'RIBAO_ENABLE_WEWE=0\n'
 } >> "$RUNTIME_DIR/guard.env"
 chmod 600 "$RUNTIME_DIR/guard.env"
 

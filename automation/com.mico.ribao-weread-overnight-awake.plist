@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mico.ribao-weread-overnight-awake</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+    <string>-t</string>
+    <string>__DURATION_SECONDS__</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__AWAKE_STDOUT_LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__AWAKE_STDERR_LOG__</string>
+</dict>
+</plist>

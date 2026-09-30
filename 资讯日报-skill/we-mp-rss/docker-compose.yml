@@ -1,0 +1,44 @@
+# WeRSS / we-mp-rss — maintained WeChat Official Account RSS fallback.
+# It runs beside the legacy WeWe RSS service during migration; it never reuses
+# the legacy service's login cache or SQLite volume.
+services:
+  we-mp-rss:
+    # Both published arm64 images failed with `exec format error` on the
+    # verified ARM64 Docker host. This is a locally rebuilt image from the
+    # fixed upstream v1.5.3 source commit; see README for rebuild controls.
+    image: local/we-mp-rss:v1.5.3
+    platform: linux/arm64
+    container_name: we-mp-rss
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8001:8001"
+    healthcheck:
+      # Use the image's application virtualenv; the base interpreter does not
+      # carry the service dependencies.  This is a local liveness check only.
+      test: ["CMD-SHELL", "/app/env_aarch64/bin/python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/feed/all.xml', timeout=5)\""]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+    environment:
+      - PORT=8001
+      - DB=sqlite:///./data/db.db
+      - ENABLE_JOB=True
+      - SEND_CODE=False
+      - GATHER.MODEL=weread_mp
+      - GATHER.CONTENT=True
+      - RSS_FULL_CONTEXT=True
+      - WEREAD_CONTENT_INTERVAL=2
+      # Optional, local-only host agent.  Values live in an ignored .env file;
+      # the collector keeps working in manual-login mode when not configured.
+      - WEREAD_REFRESH_AGENT_URL=${WEREAD_REFRESH_AGENT_URL:-}
+      - WEREAD_REFRESH_AGENT_TOKEN=${WEREAD_REFRESH_AGENT_TOKEN:-}
+      - TZ=Asia/Shanghai
+    volumes:
+      - we-mp-rss-data:/app/data
+      # Only the WeRead session file is shared with macOS Chrome. The database
+      # and all other service data remain in this service's named volume.
+      - ${WEREAD_HOST_STATE_DIR:?set WEREAD_HOST_STATE_DIR in .env}/wx.lic:/app/data/wx.lic
+
+volumes:
+  we-mp-rss-data:

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.beijing-daily-brief-test-matrix</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__PROJECT_ROOT__/run_daily_test_matrix.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LANG</key><string>en_US.UTF-8</string>
+    <key>LC_ALL</key><string>en_US.UTF-8</string>
+    <key>PATH</key><string>__PATH__</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>__TEST_LOG__</string>
+  <key>StandardErrorPath</key><string>__TEST_LOG__</string>
+</dict>
+</plist>

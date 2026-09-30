@@ -15,13 +15,13 @@ Run once:
 bash run_daily_with_feishu.sh
 ```
 
-Install the single macOS scheduler:
+Install the production macOS guard:
 
 ```bash
 bash automation/install_guard.command
 ```
 
-WeWe RSS is optional and never blocks the other sources after 15:00 BJT. It validates the live login at 11:00, performs full refreshes at 12:00 and 14:30, and alerts immediately if either operation finds an invalid account. At the 15:30 hard deadline the workflow alerts once, continues in the background, and sends only the complete QC-approved report later.
+WeWe RSS has been retired from production. The independent test matrix has its own 15:00 macOS scheduler and uses one frozen source snapshot for three isolated profiles. Once Feishu credentials and both existing index registries are restored, `bash automation/install_parallel.command` installs both schedules. See [the current handoff](运行与交接手册.md). In index-only delivery mode, neither schedule sends group messages; production continues background retries after the 15:30 deadline and only publishes a complete QC-approved report.
 
 Run all local checks before publishing:
 

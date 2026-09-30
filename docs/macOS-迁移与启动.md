@@ -1,5 +1,7 @@
 # macOS 迁移与启动
 
+> **历史文档，不可直接执行。** 本页旧 WeWe RSS 容器、扫码与重登任务步骤已退役。当前正式/测试并行日报的迁移、两份飞书索引续接与定时安装请使用 [运行与交接手册](运行与交接手册.md)。
+
 ## 最短路径：只记一条命令
 
 把迁移 ZIP 与校验文件复制到新 Mac、校验并解压后，在解压目录运行：
@@ -17,7 +19,7 @@ bash bootstrap_new_mac.command
 - 11:00 验证 WeWe 微信读书账号；
 - 12:00 首轮全量刷新，14:30 最后一轮全量刷新；
 - 15:00 生成、质检并导入飞书 Docx；
-- 更新固定的飞书日报链接索引，不发群消息、不授权群聊；
+- 更新固定的飞书日报链接索引；启用群投递时向目标群发送唯一文档链接，并让日报 Docx 与索引 Docx 都向该群授予 `full_access`（可管理）权限；
 - 15:30 未完成时告警，后台继续重试完整正式版。
 
 ## 一、旧机器：生成安全迁移包
@@ -120,7 +122,7 @@ FEISHU_CLI_IMPORT_AS=bot
 FEISHU_CLI_SEND_AS=bot
 ```
 
-如已私密迁移飞书状态文件，把它们放回新 `RIBAO_DATA_ROOT/日报状态/`。否则系统会从新日报开始创建新的日报索引文档。
+如已私密迁移飞书状态文件，把它们放回新 `RIBAO_DATA_ROOT/日报状态/`。如果索引注册表缺失，保持 `FEISHU_DAILY_INDEX=0`；自动模式会拒绝创建同名索引，待确认目标并恢复登记后再开启。只有明确需要全新索引时，才人工执行 `update_daily_index.py --mode new`。
 
 ## 五、启动并恢复 WeWe RSS
 
@@ -197,4 +199,4 @@ bash run_daily_with_feishu.sh
 - `找不到 lark-cli`：确认全局 npm bin 在 `PATH`，并重新配置 user/bot 身份。
 - WeWe 扫码后又失效：这通常是微信读书服务端风控，不是 SQLite 丢失；减少单账号源数并重新扫码。
 - 公众号列表为空：使用迁移包内的 `MIGRATION/wewe-share-links.txt` 重新添加。
-- 新建了第二份飞书索引：说明旧的 `feishu-daily-index.json` 未私密迁移；可继续使用新索引，或恢复旧状态文件后重跑。
+- 索引目标登记缺失：自动模式会阻断，避免新建第二份同名索引；恢复旧 `feishu-daily-index.json`，或用已确认的现有索引链接执行 `update_daily_index.py --register-target` 后重跑。

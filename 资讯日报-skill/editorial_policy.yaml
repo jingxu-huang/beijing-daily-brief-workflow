@@ -1,0 +1,124 @@
+version: 1
+
+# 仅影响显式启用的测试 profile；legacy 生产策略保持不变。
+# 单个宽泛关键词不得成为硬删除理由。
+profiles:
+  business_v1_test:
+    thresholds:
+      accept_score: 65
+      review_score: 40
+      partial_body_chars: 15
+      hard_reject_confidence: 0.90
+      accept_confidence: 0.90
+      review_confidence: 0.65
+    weights:
+      casual_game: 68
+      short_drama: 62
+      consumer_ai_hardware: 72
+      ai_model_application: 65
+      entertainment_business: 60
+      target_financing: 66
+      generic_game_review: 42
+      product_action_bonus: 4
+      business_evidence_bonus: 4
+      overseas_bonus: 4
+      priority_business_bonus: 8
+      hard_negative_penalty: 80
+      soft_negative_penalty: 18
+    signals:
+      casual_game: [休闲游戏, 超休闲, 混合休闲, 混休, 小游戏, 小程序游戏, 三消, 合成游戏, 放置游戏, casual game, casual games, hypercasual, hyper-casual, hybrid casual, mini game, mini-game, match-3, match 3, puzzle game, idle game, candy crush, tasty travels, subway surfers, royal match, monopoly go, dream games, voodoo]
+      # “GAMING”常出现在电脑电源、显卡等 SKU 名称中，不是游戏内容证据。
+      game: [游戏, 手游, game, steam, playstation, xbox, gta]
+      # “主机”本身也可指硬件设备，不能单独作为非休闲游戏证据。
+      non_casual_game: [3a, aaa, 主机游戏, console game, "pc 版", steam, playstation, ps5, xbox, rpg, arpg, mmo, mmorpg, ue5, 开放世界, 魂类, 射击大作, 电竞赛事, esports, 二游, 二次元游戏, 美少女游戏]
+      short_drama: [短剧, 竖屏剧, 微短剧, 漫剧, 条漫, 漫画剧, vertical drama, micro drama, short drama, short-form drama]
+      hardware: [硬件, 智能屏, 摄像机, 键盘, 耳机, 眼镜, 玩具, 可穿戴, 鼠标, 录音卡, 电视, 投影, 音箱, 回音壁, 家庭影音, 设备, robot, 机器人, 芯片, 服务器, pc, 笔记本, 显示器, 液冷, 冷排, 机箱, 内存条]
+      consumer_ai_hardware_forms: [智能屏, 闺蜜机, 智能摄像机, 家庭机器人, 陪伴机器人, 玩具机器人, 玩具, 键盘, 耳机, 眼镜, 鼠标, 录音卡, 可穿戴, 手表, 胸针, 挂件, 外设, 智能电视, 投影, smart display, smart camera, companion robot, toy, keyboard, headphones, earphones, glasses, mouse, recording card, wearable, smart tv, projector, family motion system, 家庭体感互动娱乐系统, 体感互动设备, 体感娱乐设备]
+      # 这类新形态设备不能因“盒子/边缘电脑”不在传统硬件形态表中被当作普通融资；
+      # 仍须同时满足 AI、面向用户的用途和真实发售/预订证据，故只进测试版复核层。
+      emerging_ai_device_forms: [agent hardware, ai computer, ai device, edge computer, 边缘侧电脑, 边缘计算设备, agent硬件, ai硬件, "ai 硬件", 智能硬件]
+      consumer_launch_evidence: [预订, 众筹, kickstarter, 开售, 开卖, 发售, 用户, consumers, consumer, preorder, pre-order, crowdfunding, orders]
+      target_ai_hardware: [ai陪伴, "ai 陪伴", 陪伴玩具, "ai 玩具", 智能玩具, ai键盘, "ai 键盘", 陪伴机器人, 玩具机器人, ai类机器人, "ai 类机器人", ai耳机, "ai 耳机", ai眼镜, "ai 眼镜", ai鼠标, "ai 鼠标", ai录音, "ai 录音", ai应用, "ai 应用", ai体验, "ai 体验", ai application, ai experience, ai-native, ai native, ai原生, "ai 原生", 大模型, 智能体, agent, chatgpt, openai, 实时翻译, 个人助理, 语音交互, 家庭事务, 内容理解, 家庭互动, 亲子, 体感互动, 无手柄]
+      entertainment_world_model_context: [视频模型, 视频生成, 生成画面, 可交互视频, 互动世界, 虚幻引擎, 游戏创作, 游戏生成]
+      ai_content: [ai, 人工智能, 大模型, 模型, 智能体, agent, assistant, aigc, gpt-, "gpt ", chatgpt, generative ai, video generation, image generation, music generation, 视频生成, 图像生成, 音乐生成, 内容生成, 游戏创作, 互动体验, ai陪伴, ai companion, consumer ai, personal ai, "消费者 ai", "c端 ai"]
+      ai_game_application: [游戏创作, ai游戏, "ai 游戏", ai原生游戏, "ai 原生游戏", ai视频, "ai 视频", 视频生成, 生成内容, 智能npc, "智能 npc", 玩家共创, 游戏二创, 互动体验]
+      target_financing: [休闲游戏, 超休闲, 混合休闲, 小游戏, ai陪伴, "ai 陪伴", ai companion, ai toy, ai hardware, 内容生成, 视频生成, 图像生成, 音乐生成, 游戏创作, 互动体验, 家庭互动, 家庭体感互动娱乐系统, 体感互动, 亲子互动, 无手柄, 创作工具, 美术教学, 素描, 速写, dating, 社交, social app, social world, 网文, 小说, "ip 改编", consumer ai, personal ai, "消费者 ai"]
+      social_literature: [网文, 小说, " ip ", 社交, dating, social app, social platform, social world, social-world, 语聊, 陪伴应用]
+      product_action: [发布, 上线, 推出, 更新, 开放, 公测, 内测, 测试, 开售, 合作, 收购, 并购, launch, launches, launched, release, releases, released, update, updates, updated, open, opens, opened, add, adds, added, revamp, revamps, revamped, testing, test, tease, acquire, acquisition, partnership]
+      business_evidence: [用户, 收入, 流水, 下载, 留存, 订阅, 转化, 投放, 买量, 广告, 营销, 榜单, 排名, 市场份额, mau, dau, users, revenue, downloads, retention, subscription, conversion, advertising, marketing, ranking]
+      priority_business: [高流水, 小游戏矩阵, 发行工厂, 海外爆款, 全球收入, 海外收入, 用户规模, 达人营销, 营销自动化, ai支付, "ai 支付", ai钱包, "ai 钱包", music generation, video generation, image generation, creator economy, ad platform, advertising, 收购, 并购]
+      # AI 增长/归因/广告工具是明确的业务提权项；必须同时是产品更新，
+      # 不能把行业报告或广告市场评论当作产品新闻。
+      ai_growth_product_subject: [归因, attribution, referral, referrals, chatgpt ads, ai ads, 广告工具, 营销工具, 增长工具]
+      # 只把“模型训练/评测结果”作为训练门禁。报告、指数、审计和观点不能
+      # 因一个宽泛词被伪装成训练新闻；它们仍会在后续业务相关性层被判定。
+      # 头部厂商具体模型进展可单源保留；非头部训练事件须多源精确合并后提权。
+      ai_training_low_value: [训练, 预训练, 后训练, 微调, training, pre-training, pretraining, post-training, posttraining, fine-tuning, finetuning, 研究成果, 研究论文, 学术研究, 论文, 学术, 评测, 基准测试, benchmark, benchmarks, evaluation, evaluations, 实验结果, 测试结果]
+      major_ai_lab: [openai, anthropic, google deepmind, google, meta ai, xai, microsoft, 微软, 字节跳动, 谷歌, 阿里巴巴, 阿里云, 阿里, 千问, 腾讯, 百度, 科大讯飞, 讯飞, deepseek, 深度求索, 智谱, minimax, 稀宇科技]
+      # 只收明确版本号的具名模型；不能用“语音模型”等泛称绕过训练/评测门禁。
+      model_anchor_family: [gpt, claude, gemini, qwen, llama, deepseek, grok, sora, ernie, glm, kimi, minimax, internlm, zgcm, 文心, 通义千问, 混元, 豆包, 书生, spark-audio]
+      # 仅这些头部模型家族可凭单源的具名正式进展通过；其余模型仍需精确多源佐证。
+      major_model_family: [gpt, claude, gemini, qwen, llama, deepseek, grok, sora, ernie, glm, kimi, minimax, 文心, 通义千问, 混元, 豆包, spark-audio]
+      ai_target_application: [游戏创作, 互动体验, 视频生成, 图像生成, 音乐生成, 内容生成, 创作工具, 创作者, creator, 视频素材, 3d创作, blender, 美术创作, 设计创作, 文档生成, 演示文稿, 幻灯片, 文档编辑, 办公创作, docs, slides, presentation, office, design, 消费者ai, "消费者 ai", ai陪伴, "ai 陪伴", 营销自动化, 达人营销, 语音助手, 语音转写, 内容组织, 成文润色, 表达辅助, 照片编辑, 家居设计, home design, interior design, room redesign, redesign your room]
+      # 已确认但偏通用的个人/家庭/小团队助手不冒充严格版的内容娱乐产品；
+      # 只在平衡版/高召回版作为“高证据复核”比较。
+      ai_general_product: [智能助手, ai助手, "ai 助手", ai assistant, personal assistant, 多智能体助手, "多智能体 ai 助手", 协作中枢, 家庭助手]
+      user_facing_context: [家庭, 个人, 一人公司, 小团队, 消费者, 用户, family, personal, individual, small team, consumer, users]
+      # 仅用于把“具名用户产品”留入可扩展复核池，不作为拒绝其他 AI 内容的门槛。
+      consumer_ai_application_subject: [智能体, agent, 助手, assistant, app, 应用, 工具, tool, 创作者, creator, 创作, 视频, 图像, 音乐, 广告, 营销, 家庭, 社交, dating, 语音, 翻译, 办公]
+      platform_business_anchor: [字节, 抖音, tiktok, 豆包, seedance, openai, anthropic, meta, google, 腾讯, 阿里, 千问]
+      # 明确的品牌卖货、商家经营和选品案例不属于日报的社交平台业务跟踪；
+      # 只有平台自身的产品、政策或创作者功能变化才可保留。
+      pure_crossborder_commerce_actor: [品牌, 卖家, 商家, 店铺, 选品, 商品, 服装, 家居, 3c]
+      # 企业云、能源/电力和行业数字化方法论可留审计，但不是面向消费者、
+      # 内容创作或泛娱乐业务的 AI 产品资讯，任何测试版本均不自动采用。
+      enterprise_infrastructure_subject: [企业级, 行业落地, 行业智能, 政务, 电力, 能源, 电网, agentic cloud, 华为云, 云服务, 算力, 基础设施]
+      unconfirmed_claim: [偷跑, 传闻, 疑似, 消息称, 曝料, rumor, rumours, rumored, reportedly, leak, leaked]
+      recall_extra: [手游, 三消, 合成游戏, 放置游戏, social, social world, social-world, creator, 创作者, 营销, 广告, ai assistant, personal ai, music generation, video generation, image generation, candy crush, tasty travels, subway surfers, royal match, monopoly go, dream games, voodoo]
+      overseas: [出海, 海外, 全球, 美国, 日本, 东南亚, 中东, 欧洲]
+      hard_off_topic: [robotaxi, robovan, 无人车, 自动驾驶, 火箭, 卫星, 航天, 航天器, 小行星, 太空采矿, spacecraft, asteroid, space mining, 太空算力, 具身智能, 人形机器人, 四足机器人, 机械臂, 宇树, 电诈, 反诈, 数据中心, data center, data centers, server farm, 晶圆, 光刻]
+    # 训练/评测的多源佐证，必须按不同版本分别达到此独立发布者数量。
+    ai_evidence:
+      multi_source_min: 2
+
+  # 与当前测试版相同的“正文不少于10条、无不相关内容”合同。
+  # 仅继承已修复的召回/正文清洗/分类逻辑，不放宽准入阈值。
+  business_v2_strict:
+    base_profile: business_v1_test
+    thresholds:
+      accept_score: 65
+      review_score: 40
+    ai_evidence:
+      multi_source_min: 3
+    selection:
+      auto_include_complete_review: false
+      min_review_score: 999
+      max_items: 25
+
+  # 目标 25 条的平衡版本；允许更多完整正文灰区进入编辑复核。
+  business_v2_balanced:
+    base_profile: business_v1_test
+    thresholds:
+      accept_score: 54
+      review_score: 30
+    ai_evidence:
+      multi_source_min: 2
+    selection:
+      auto_include_complete_review: true
+      min_review_score: 42
+      allowed_review_tiers: [high, medium_safe]
+      max_items: 25
+
+  # 目标 25 条的高召回版本；明确 OUT 与高置信硬拒绝仍保持不变。
+  business_v2_recall:
+    base_profile: business_v1_test
+    thresholds:
+      accept_score: 40
+      review_score: 15
+    ai_evidence:
+      multi_source_min: 2
+    selection:
+      auto_include_complete_review: true
+      min_review_score: 15
+      allowed_review_tiers: [high, medium_safe, medium]
+      max_items: 25

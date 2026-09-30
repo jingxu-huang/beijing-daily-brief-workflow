@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mico.ribao-weread-overnight-probe</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/false</string>
+    <string>__PROBE_SCRIPT__</string>
+    <string>step</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RIBAO_WEREAD_OMNI_DATA_ROOT</key>
+    <string>__DATA_ROOT__</string>
+    <key>RIBAO_OVERNIGHT_PROBE_PLIST</key>
+    <string>__PROBE_PLIST__</string>
+    <key>RIBAO_OVERNIGHT_AWAKE_PLIST</key>
+    <string>__AWAKE_PLIST__</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Minute</key><integer>45</integer></dict>
+  </array>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__STDOUT_LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__STDERR_LOG__</string>
+</dict>
+</plist>

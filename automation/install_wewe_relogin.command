@@ -21,10 +21,15 @@ if [ -z "${WEWE_AUTH_CODE:-}" ]; then
   echo "Set WEWE_AUTH_CODE in config.env before installing the relogin service." >&2
   exit 1
 fi
-command -v cloudflared >/dev/null 2>&1 || {
-  echo "cloudflared is required. Install it, then rerun this installer." >&2
-  exit 1
-}
+ENABLE_REMOTE_RELOGIN="${RIBAO_ENABLE_REMOTE_RELOGIN:-0}"
+if [ "$ENABLE_REMOTE_RELOGIN" = "1" ]; then
+  command -v cloudflared >/dev/null 2>&1 || {
+    echo "RIBAO_ENABLE_REMOTE_RELOGIN=1 requires cloudflared. Install it, then rerun this installer." >&2
+    exit 1
+  }
+else
+  echo "Installing local-only WeWe relogin page (remote tunnel disabled)."
+fi
 "$PYTHON_BIN" -c 'import qrcode, qrcode.image.svg' >/dev/null 2>&1 || {
   echo "Python package qrcode is required: $PYTHON_BIN -m pip install qrcode" >&2
   exit 1
@@ -48,6 +53,7 @@ chmod 755 "$APP_DIR/wewe_relogin_server.py"
   printf 'RELOGIN_PORT=%q\n' "${RELOGIN_PORT:-4001}"
   printf 'WEWE_RSS_URL=%q\n' "${WEWE_RSS_URL:-http://127.0.0.1:4000}"
   printf 'WEWE_AUTH_CODE=%q\n' "$WEWE_AUTH_CODE"
+  printf 'RIBAO_ENABLE_REMOTE_RELOGIN=%q\n' "$ENABLE_REMOTE_RELOGIN"
   printf 'TUNNEL_TTL_MINUTES=%q\n' "${TUNNEL_TTL_MINUTES:-360}"
 } > "$APP_DIR/relogin.env"
 chmod 600 "$APP_DIR/relogin.env"

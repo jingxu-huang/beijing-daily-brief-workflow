@@ -13,11 +13,46 @@
 # ============================================================
 
 config:
-  rsshub_base: "https://rsshub.app"        # ← 自建后改这里
+  rsshub_base: "http://127.0.0.1:1200"     # 本地固定版本 RSSHub；避免公共实例 403/限速
   # 时间窗：默认按北京时间 昨15:00（含）—今15:00（不含）滚动窗口（脚本自动算，无需配）；--date 可指定历史日期测试
   select:
     per_track_top: 7      # 每赛道精选上限
     total_cap: 30         # 建议整篇成稿条数上限（agent 控篇幅用）
+  quality_gate:
+    min_selected_candidates: 8  # 候选池过小通常意味着滚动 feed 已过期或公开源异常
+    min_selected_sources: 3     # 防止单一来源独占并掩盖其他源失效
+    max_failed_public_sources: 2
+    # 正式版与产品约定一致：少于 10 条不发布，不能以无理由跳过掩盖缩量。
+    min_report_items: 10
+    min_report_sources: 3
+    # 每条都必须有足够的事实信息；不能把标题改写成一句话用于补足总条数。
+    # 200–400 字仍是写作目标，120 是阻止“标题级短句”进入正式成稿的底线。
+    min_report_body_chars: 120
+  # 默认不改变在役日报；business_v1_test 仅用于测试。业务信号/权重/三态阈值见 editorial_policy.yaml。
+  # 它坚持“宁缺毋滥”：日报少于 10 条直接失败，不能用非相关资讯补数。
+  editorial_policy:
+    active_profile: legacy
+    profiles:
+      business_v1_test:
+        quality_gate:
+          # 公众号增强源不能替代公开源，但也不应把公开候选门槛抬到成稿门槛之上。
+          # 公开源仍需达到正式基线8条/3来源；最终成稿另由10条/3来源硬门禁控制。
+          min_selected_candidates: 8
+          min_selected_sources: 3
+          max_failed_public_sources: 2
+          min_report_items: 10
+          min_report_sources: 3
+          # 防止备选补位退化为“标题改写一句话”；只在隔离测试版生效。
+          min_report_body_chars: 80
+      # v2 shares the same factual-body floor as the historical test profile.
+      # Its three variants differ in structured review expansion, not by
+      # silently changing source coverage or body completeness requirements.
+      business_v2_strict:
+        quality_gate: {min_selected_candidates: 8, min_selected_sources: 3, max_failed_public_sources: 2, min_report_items: 10, min_report_sources: 3, min_report_body_chars: 80}
+      business_v2_balanced:
+        quality_gate: {min_selected_candidates: 8, min_selected_sources: 3, max_failed_public_sources: 2, min_report_items: 10, min_report_sources: 3, min_report_body_chars: 80}
+      business_v2_recall:
+        quality_gate: {min_selected_candidates: 8, min_selected_sources: 3, max_failed_public_sources: 2, min_report_items: 10, min_report_sources: 3, min_report_body_chars: 80}
   dedup: true             # 去重：链接精确 + 跨源标题近重复
 
 # ============================================================
@@ -101,6 +136,34 @@ sources:
     autoclassify: true
     note: "WeWe RSS 把公众号转 RSS（见 wewe-rss/README.md）；all 源按标题自动分流，重点源可另配单源 RSS。未部署时守门器会自动降级，不阻断其他渠道。"
     enabled: true
+
+  # 直连微信读书的本机增强源。它补充已订阅公众号，但不计入公开源覆盖门禁；
+  # 15:00 前不可用时会自动排除，绝不阻断公开源日报。
+  - name: 微信公众号(WeRSS)
+    tier: 1
+    board: 创新·AI娱乐
+    track: AI模型与应用（娱乐向）
+    type: rss
+    url: "http://127.0.0.1:8001/feed/all.xml"
+    autoclassify: true
+    enhancement_source: werss
+    note: "旧 WeRSS / we-mp-rss v1.5.3 增强源；2026-09-07 起默认停用并保留回退，数据卷与镜像不得删除。"
+    enabled: false
+
+  # 新公众号链路只在显式测试模式启用。Feed 由 weread-omni/sync_window.mjs
+  # 写到 Git 外；正式日报不会因为本机残留测试文件而自动接入。
+  - name: 微信公众号(weread-omni测试)
+    tier: 1
+    board: 创新·AI娱乐
+    track: AI模型与应用（娱乐向）
+    type: rss
+    url: ""
+    url_env: RIBAO_WEREAD_OMNI_FEED_URL
+    enabled_env: RIBAO_ENABLE_WEREAD_OMNI_TEST
+    autoclassify: true
+    enhancement_source: weread_omni
+    note: "weread-omni v0.1.1 隔离测试源；必须显式开启，不计入公开源覆盖。"
+    enabled: false
 
   # ============ Tier 2 垂直补充源 ============
   # —— 游戏（媒体/RSS）——
@@ -356,8 +419,8 @@ sources:
     track: 泛AI·AI应用融资
     type: web
     url: "https://www.itjuzi.com/"
-    note: "国内融资库，需登录看全量；列表页可抓"
-    enabled: true
+    note: "结构性登录源：公开入口只提供登录壳，完整融资数据需账号授权；为避免把登录页当资讯，默认禁用，后续接入合规授权/API 后再启用。"
+    enabled: false
   - name: 36氪-融资
     board: 全球融资
     track: 泛娱乐融资
@@ -380,8 +443,8 @@ sources:
     fetch_body: true
     body_limit: 8
     body_chars: 900
-    note: "✅ TNGlobal / TechNode Global RSS 已验证可访问；补东南亚科技、AI、出海与融资动态。"
-    enabled: true
+    note: "用户确认信息质量一般，正式日报停用；保留注册信息供后续复评。"
+    enabled: false
   - name: Business Wire
     board: 全球融资
     track: 泛AI·AI应用融资
@@ -394,7 +457,7 @@ sources:
     track: 泛AI·AI应用融资
     type: web
     url: "https://www.startuphub.ai/feed/"
-    note: "海外 AI 创业/融资，有免费 API/MCP"
+    note: "公开 feed 自动探测源；单次 403/网络失败只记入公开源健康告警和失败门禁，不作为永久禁用依据。"
     enabled: true
 
   # ------------------------------------------------------------

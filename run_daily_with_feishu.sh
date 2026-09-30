@@ -37,6 +37,7 @@ STATE_DIR="${RIBAO_STATE_DIR:-$DATA_ROOT/日报状态}"
 FEISHU_CLI_SCRIPT="$ROOT_DIR/local-only/feishu-bot/send_to_feishu_cli.py"
 FEISHU_INDEX_SCRIPT="$ROOT_DIR/local-only/feishu-bot/update_daily_index.py"
 REPORT_CHAT_ID="${FEISHU_REPORT_CHAT_ID:-}"
+FEISHU_ENABLED="${RIBAO_ENABLE_FEISHU:-0}"
 mkdir -p "$REPORT_DIR" "$DRAFT_DIR" "$CHECK_DIR" "$STATE_DIR"
 
 # launchd 环境 PATH 精简；补上 nvm 下的 lark-cli / codex。
@@ -89,7 +90,11 @@ alert() {
   if [ "${RIBAO_GUARD_MANAGED:-0}" = "1" ]; then
     return 0
   fi
-  if [ -z "$REPORT_CHAT_ID" ]; then
+  if [ "$FEISHU_ENABLED" != "1" ]; then
+    echo "[$(date '+%F %T')] 飞书能力未启用，外部告警已跳过（${tag}）"
+  elif [ "${RIBAO_GROUP_MESSAGES:-1}" = "0" ]; then
+    echo "[$(date '+%F %T')] 群消息已禁用，飞书告警已跳过（${tag}）"
+  elif [ -z "$REPORT_CHAT_ID" ]; then
     echo "[$(date '+%F %T')] WARN: FEISHU_REPORT_CHAT_ID 未配置，飞书告警已跳过（${tag}）"
   elif command -v lark-cli >/dev/null 2>&1; then
     lark-cli im +messages-send \
@@ -106,6 +111,18 @@ alert() {
 
 echo "[$(date '+%F %T')] 目标日期 ${YMD}"
 MANIFEST --step wrapper_start --status ok
+if [ "${RIBAO_TEST_MODE:-0}" = "1" ]; then
+  WEREAD_TEST_STATUS="${RIBAO_WEREAD_OMNI_CHANNEL_STATUS:-unavailable}"
+  WEREAD_TEST_DETAIL="status=${WEREAD_TEST_STATUS} accounts=${RIBAO_WEREAD_OMNI_ACCOUNTS:-0} items=${RIBAO_WEREAD_OMNI_CHANNEL_ITEMS:-0} fresh_sources=${RIBAO_WEREAD_OMNI_FRESH_SOURCES:-0} stale_sources=${RIBAO_WEREAD_OMNI_STALE_SOURCES:-0} unassessed_sources=${RIBAO_WEREAD_OMNI_UNASSESSED_SOURCES:-0} failure_class=${RIBAO_WEREAD_OMNI_FAILURE_CLASS:-none}"
+  case "$WEREAD_TEST_STATUS" in
+    healthy|cached)
+      MANIFEST --step weread_omni_preflight --status ok --detail "$WEREAD_TEST_DETAIL"
+      ;;
+    *)
+      MANIFEST --step weread_omni_preflight --status warn --detail "$WEREAD_TEST_DETAIL"
+      ;;
+  esac
+fi
 
 # 时钟对表结果落 manifest（SKEW 已在入口计算并导出）。偏差大时状态记 warn 而非 ok，
 # 且告警指明最可能根因（时区配错），并说明本次已自动校正、不影响交付。
@@ -164,46 +181,76 @@ fi
 # PASS 直接发；WARN 属"需人工复核"的软提示（如数字待核对）仍会发送。
 # 若想更严格"仅 PASS 才发"，把上面判断改为：[ "$VERDICT" != "PASS" ] && 拦截。
 
+if [ "$FEISHU_ENABLED" != "1" ]; then
+  MANIFEST --step publish --status skipped --detail "RIBAO_ENABLE_FEISHU=0"
+  MANIFEST --final generated --kv "reason=本地成稿与质检完成，飞书能力未启用"
+  echo "[$(date '+%F %T')] 已生成并通过质检；RIBAO_ENABLE_FEISHU=0，明确跳过全部飞书写入。"
+  exit 0
+fi
+
 if [ ! -f "$FEISHU_CLI_SCRIPT" ]; then
   MANIFEST --final failed --kv "reason=缺发送脚本"
   alert nosender "找不到发送脚本 ${FEISHU_CLI_SCRIPT}，成稿已生成但未投递"
   exit 1
 fi
 
-if [ -z "$REPORT_CHAT_ID" ]; then
-  if [ "${FEISHU_DOC_ONLY:-0}" = "1" ]; then
-    echo "[$(date '+%F %T')] 4/4 导入飞书文档（doc-only；不授权群、不发送消息）..."
-    if "$PYTHON_BIN" "$FEISHU_CLI_SCRIPT" --report "$REPORT" --check "$CHECK" --date "$YMD" --import-as "${FEISHU_CLI_IMPORT_AS:-bot}" --doc-only; then
-      MANIFEST --step publish --status ok --detail "doc-only"
-      if [ "${FEISHU_DAILY_INDEX:-0}" = "1" ]; then
-        echo "[$(date '+%F %T')] 5/5 更新飞书日报链接索引..."
-        if "$PYTHON_BIN" "$FEISHU_INDEX_SCRIPT" --date "$YMD" --import-as "${FEISHU_CLI_IMPORT_AS:-bot}"; then
-          MANIFEST --step index --status ok
-        else
-          MANIFEST --step index --status fail
-          MANIFEST --final failed --kv "reason=飞书日报链接索引更新失败"
-          alert indexfail "日报文档已生成，但飞书日报链接索引更新失败。请排查后重跑本脚本"
-          exit 1
-        fi
+if [ "${FEISHU_DOC_ONLY:-0}" = "1" ]; then
+  if [ "${RIBAO_TEST_MODE:-0}" = "1" ] && [ "${FEISHU_TEST_SKIP_PERMISSION:-0}" = "1" ]; then
+    echo "[$(date '+%F %T')] 4/4 导入独立飞书测试文档（不授予小组权限、不发送群消息）..."
+  else
+    echo "[$(date '+%F %T')] 4/4 导入飞书文档并授予目标群可管理权限（不发送群消息）..."
+  fi
+  if "$PYTHON_BIN" "$FEISHU_CLI_SCRIPT" --report "$REPORT" --check "$CHECK" --date "$YMD" --import-as "${FEISHU_CLI_IMPORT_AS:-user}" --doc-only; then
+    MANIFEST --step publish --status ok --detail "index-only"
+    if [ "${FEISHU_DAILY_INDEX:-0}" != "1" ]; then
+      if [ "${RIBAO_TEST_MODE:-0}" = "1" ] && [ "${FEISHU_TEST_SKIP_INDEX:-0}" = "1" ]; then
+        MANIFEST --step index --status skipped --detail "isolated test document; production index unchanged"
+        MANIFEST --final generated --kv "reason=独立测试版飞书文档写入完成；小组权限结果见发布回执；正式索引保持不变"
+        exit 0
       fi
-      MANIFEST --final generated --kv "reason=飞书文档已生成，未配置群发送"
+      MANIFEST --step index --status fail --detail "FEISHU_DAILY_INDEX=0"
+      MANIFEST --final failed --kv "reason=索引交付模式未启用固定索引"
+      alert indexdisabled "日报文档已生成，但索引交付模式未启用固定索引"
+      exit 1
+    fi
+    echo "[$(date '+%F %T')] 5/5 更新飞书日报链接索引并授予目标群可管理权限..."
+    if "$PYTHON_BIN" "$FEISHU_INDEX_SCRIPT" --date "$YMD" --import-as "${FEISHU_CLI_IMPORT_AS:-user}"; then
+      MANIFEST --step index --status ok --detail "group full_access"
+      MANIFEST --final generated --kv "reason=飞书日报已写入固定索引；未发送群消息"
       exit 0
     fi
-    MANIFEST --step publish --status fail --detail "doc-only import failed"
-    MANIFEST --final failed --kv "reason=飞书文档导入失败"
-    alert docimportfail "质检 ${VERDICT}，但飞书文档导入失败。成稿在 日报文档/资讯类简报-${MD}日.md，排查后重跑本脚本即可"
+    MANIFEST --step index --status fail
+    MANIFEST --final failed --kv "reason=飞书日报链接索引更新或授权失败"
+    alert indexfail "日报文档已生成，但飞书日报链接索引更新或授权失败。请排查后重跑本脚本"
     exit 1
-  else
-    MANIFEST --step publish --status skipped --detail "FEISHU_REPORT_CHAT_ID not configured"
-    MANIFEST --final generated --kv "reason=飞书群未配置"
-    echo "[$(date '+%F %T')] 已生成并通过质检；FEISHU_REPORT_CHAT_ID 未配置，明确跳过飞书发送。"
-    exit 0
   fi
+  MANIFEST --step publish --status fail --detail "index-only import failed"
+  MANIFEST --final failed --kv "reason=飞书文档导入失败"
+  alert docimportfail "质检 ${VERDICT}，但飞书文档导入失败。成稿在 日报文档/资讯类简报-${MD}日.md，排查后重跑本脚本即可"
+  exit 1
+fi
+
+if [ -z "$REPORT_CHAT_ID" ]; then
+  MANIFEST --step publish --status skipped --detail "FEISHU_REPORT_CHAT_ID not configured"
+  MANIFEST --final generated --kv "reason=飞书群未配置"
+  echo "[$(date '+%F %T')] 已生成并通过质检；FEISHU_REPORT_CHAT_ID 未配置，明确跳过飞书发送。"
+  exit 0
 fi
 
 echo "[$(date '+%F %T')] 4/4 投递飞书（结论：${VERDICT}；同日已有文档则原地更新，不新建链接）..."
-if "$PYTHON_BIN" "$FEISHU_CLI_SCRIPT" --report "$REPORT" --check "$CHECK" --date "$YMD" --chat-id "$REPORT_CHAT_ID" --perm edit --send-as "${FEISHU_CLI_SEND_AS:-bot}"; then
+if "$PYTHON_BIN" "$FEISHU_CLI_SCRIPT" --report "$REPORT" --check "$CHECK" --date "$YMD" --chat-id "$REPORT_CHAT_ID" --perm "${FEISHU_REPORT_CHAT_PERM:-full_access}" --send-as "${FEISHU_CLI_SEND_AS:-bot}"; then
   MANIFEST --step publish --status ok
+  if [ "${FEISHU_DAILY_INDEX:-0}" = "1" ]; then
+    echo "[$(date '+%F %T')] 5/5 更新飞书日报链接索引..."
+    if "$PYTHON_BIN" "$FEISHU_INDEX_SCRIPT" --date "$YMD" --import-as "${FEISHU_CLI_IMPORT_AS:-bot}"; then
+      MANIFEST --step index --status ok
+    else
+      MANIFEST --step index --status fail
+      MANIFEST --final failed --kv "reason=飞书日报链接索引更新失败"
+      alert indexfail "日报文档已投递，但飞书日报链接索引更新失败。请排查后重跑本脚本"
+      exit 1
+    fi
+  fi
   MANIFEST --final sent
   if REMOVED="$("$PYTHON_BIN" "$SKILL_DIR/codex_external.py" --root "$ROOT_DIR" cleanup-success --date "$YMD")"; then
     MANIFEST --step codex_cleanup --status ok --detail "removed_external_workdirs=${REMOVED}"

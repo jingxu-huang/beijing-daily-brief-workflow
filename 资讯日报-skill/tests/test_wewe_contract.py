@@ -19,6 +19,41 @@ class WeweContractTests(unittest.TestCase):
         ):
             self.assertEqual(wewe_preflight.probe_health()["status"], "service_down")
 
+    def test_missing_dedicated_relogin_page_falls_back_to_add_account_dashboard(self):
+        with mock.patch.object(wewe_preflight, "RELOGIN_TOKEN", ""), mock.patch.object(
+            wewe_preflight, "DASH_URL", "http://127.0.0.1:4000/dash/accounts"
+        ):
+            self.assertEqual(
+                wewe_preflight.relogin_local_url(),
+                "http://127.0.0.1:4000/dash/accounts",
+            )
+
+    def test_transient_source_error_does_not_open_relogin_page(self):
+        with mock.patch(
+            "wewe_preflight.check_once",
+            side_effect=wewe_preflight.WeweError("HTTP 500: upstream 502"),
+        ), mock.patch("wewe_preflight.alert_source_unavailable") as unavailable, mock.patch(
+            "wewe_preflight.open_relogin_page"
+        ) as relogin:
+            self.assertEqual(wewe_preflight.precheck_once(), 4)
+        unavailable.assert_called_once()
+        relogin.assert_not_called()
+
+    def test_fixed_reminder_redacts_local_qr_token_and_verbose_502_details(self):
+        token = "private-local-token"
+        reason = "源甲: HTTP 500: Request failed with status code 502; 源乙: HTTP 500: Request failed with status code 502"
+        with mock.patch.object(wewe_preflight, "RELOGIN_TOKEN", token), mock.patch(
+            "wewe_preflight.start_dialog_async", return_value={"started": True, "pid": 7}
+        ) as dialog:
+            result = wewe_preflight.send_fixed_guard_reminder(
+                target_ymd="20260805", stage="1200", reason=reason, show_dialog=True
+            )
+        self.assertTrue(result["ok"])
+        message = dialog.call_args.args[1]
+        self.assertNotIn(token, message)
+        self.assertNotIn("源甲", message)
+        self.assertIn("上游请求返回 502", message)
+
     def test_target_ymd_window_does_not_roll_back_before_15(self):
         with mock.patch.dict(
             "os.environ",
@@ -33,7 +68,12 @@ class WeweContractTests(unittest.TestCase):
         self.assertEqual(end_bj.strftime("%Y-%m-%d %H:%M:%S"), "2026-08-20 15:00:00")
 
     def test_fixed_reminder_mentions_15_cutoff_and_both_channels(self):
-        with mock.patch.object(wewe_preflight, "FEISHU_CHAT_ID", "oc_mock"), mock.patch(
+        # Local production can explicitly disable group messages.  This test
+        # verifies the enabled-channel contract, so isolate it from that
+        # machine-level switch.
+        with mock.patch.object(wewe_preflight, "GROUP_MESSAGES_ENABLED", True), mock.patch.object(
+            wewe_preflight, "FEISHU_CHAT_ID", "oc_mock"
+        ), mock.patch(
             "wewe_preflight.request_remote_scan_url", return_value="https://scan.example/x"
         ), mock.patch(
             "wewe_preflight.open_relogin_page"

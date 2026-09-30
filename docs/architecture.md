@@ -1,5 +1,7 @@
 # Architecture
 
+> Historical diagram below predates the retirement of WeWe RSS and the separate test matrix. Do not use its WeWe nodes or single-scheduler claim for deployment. The operative production/test architecture, permissions and Feishu targets are in [运行与交接手册](运行与交接手册.md).
+
 ## Time and delivery state machine
 
 ```mermaid

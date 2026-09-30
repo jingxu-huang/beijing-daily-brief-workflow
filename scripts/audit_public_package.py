@@ -105,7 +105,11 @@ def scan_text(name: str, data: bytes) -> list[str]:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return ["non-UTF-8 content in text-like file"]
-    return [label for label, pattern in content_patterns().items() if pattern.search(text)]
+    findings = []
+    for label, pattern in content_patterns().items():
+        if pattern.search(text):
+            findings.append(label)
+    return findings
 
 
 def scan_root(root: Path) -> list[tuple[str, str]]:

@@ -1,0 +1,15 @@
+services:
+  rsshub:
+    image: diygod/rsshub@sha256:953fd46b21ee11252bd6df5e6752808feab95f710ee8bed7fd770e4e2cb6f6c5
+    container_name: ribao-rsshub
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1200:1200"
+    environment:
+      NODE_ENV: production
+      CACHE_EXPIRE: "900"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:1200/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

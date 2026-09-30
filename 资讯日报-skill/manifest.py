@@ -10,6 +10,7 @@
     python3 manifest.py --date 20260708 --step qc --status fail --detail "verdict=FAIL"
     python3 manifest.py --date 20260708 --kv verdict=PASS --kv doc_url=https://...
     python3 manifest.py --date 20260708 --final sent
+    python3 manifest.py --date 20260708 --read-step-status fetch
 
 manifest 结构：
     {
@@ -68,6 +69,21 @@ def now_str():
     return now.astimezone(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S+08:00")
 
 
+def read_step_status(path, step):
+    """Return a prior step status without mutating the manifest.
+
+    Missing, malformed or incomplete state is deliberately treated as unknown so
+    callers fail closed instead of reusing an unverified artifact.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        status = data.get("steps", {}).get(step, {}).get("status", "")
+    except (OSError, TypeError, ValueError):
+        return ""
+    return status if isinstance(status, str) else ""
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", required=True, help="YYYYMMDD")
@@ -76,11 +92,16 @@ def main():
     ap.add_argument("--detail", default="", help="补充说明（配合 --step）")
     ap.add_argument("--kv", action="append", default=[], help="顶层键值，如 verdict=PASS，可多次")
     ap.add_argument("--final", default="", help="终态：sent | blocked | failed")
+    ap.add_argument("--read-step-status", default="", help="只读输出既有步骤状态，不更新 manifest")
     ap.add_argument("--state-dir", default=os.environ.get("RIBAO_STATE_DIR") or os.path.join(ROOT_DIR, "日报状态"))
     args = ap.parse_args()
 
-    os.makedirs(args.state_dir, exist_ok=True)
     path = os.path.join(args.state_dir, f"run-manifest-{args.date}.json")
+    if args.read_step_status:
+        print(read_step_status(path, args.read_step_status))
+        return
+
+    os.makedirs(args.state_dir, exist_ok=True)
 
     data = {}
     if os.path.exists(path):
@@ -108,6 +129,8 @@ def main():
             data[k] = v
     if args.final:
         data["final"] = args.final
+        if args.final in {"generated", "sent"}:
+            data.pop("run_exit", None)
         if args.final == "sent":
             data.pop("reason", None)
 

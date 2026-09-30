@@ -18,9 +18,11 @@
 """
 
 import argparse
+import copy
 import datetime as dt
 import email.utils
 import glob
+import hashlib
 import html as _html
 import json
 import os
@@ -28,7 +30,8 @@ import re
 import socket
 import subprocess
 import sys
-from collections import defaultdict
+import uuid
+from collections import Counter, defaultdict
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 socket.setdefaulttimeout(20)  # 单源最长等待，避免死源拖垮整体
@@ -55,6 +58,1061 @@ URL_RE = re.compile(r"https?://[^\s)\]>]+")
 LISTPAGE_SOURCE_MARKERS = ("｜白鲸出海", "｜36氪出海", "｜DoNews")
 WEWE_RAW_RSS_MAX_BYTES = int(os.environ.get("WEWE_RAW_RSS_MAX_BYTES", str(150 * 1024 * 1024)))
 EVENT_AUDIT_MAX_ITEMS = int(os.environ.get("RIBAO_EVENT_AUDIT_MAX_ITEMS", "50"))
+EDITORIAL_AUDIT_MAX_ITEMS = int(os.environ.get("RIBAO_EDITORIAL_AUDIT_MAX_ITEMS", "100"))
+PUBLIC_SOURCE_TYPES = {"aibot", "listpage", "sitemap", "rss", "web"}
+EDITORIAL_POLICY_ENV = "RIBAO_EDITORIAL_POLICY"
+EDITORIAL_POLICY_FILE = os.path.join(HERE, "editorial_policy.yaml")
+QUALITY_GATE_ENV = {
+    "min_selected_candidates": "RIBAO_MIN_SELECTED_CANDIDATES",
+    "min_selected_sources": "RIBAO_MIN_SELECTED_SOURCES",
+    "max_failed_public_sources": "RIBAO_MAX_FAILED_PUBLIC_SOURCES",
+    "min_report_items": "RIBAO_MIN_REPORT_ITEMS",
+    "min_report_sources": "RIBAO_MIN_REPORT_SOURCES",
+    "min_report_body_chars": "RIBAO_MIN_REPORT_BODY_CHARS",
+}
+
+
+# 编辑准入策略和抓取关键词是两道不同的门。业务信号、权重和阈值从
+# editorial_policy.yaml 单点加载，避免散落在代码与 sources.yaml 中相互漂移。
+def _load_editorial_policy_document():
+    with open(EDITORIAL_POLICY_FILE, encoding="utf-8") as handle:
+        document = yaml.safe_load(handle) or {}
+    if document.get("version") != 1:
+        raise ValueError("editorial_policy.yaml version must be 1")
+    return document
+
+
+EDITORIAL_POLICY_DOCUMENT = _load_editorial_policy_document()
+BUSINESS_V1_POLICY = EDITORIAL_POLICY_DOCUMENT["profiles"]["business_v1_test"]
+BUSINESS_V1_SIGNALS = BUSINESS_V1_POLICY["signals"]
+TEST_EDITORIAL_PROFILES = {
+    "business_v1_test",
+    "business_v2_strict",
+    "business_v2_balanced",
+    "business_v2_recall",
+}
+
+
+def _configured_signals(name):
+    return tuple(str(value).lower() for value in BUSINESS_V1_SIGNALS.get(name, []))
+
+
+CASUAL_GAME_SIGNALS = _configured_signals("casual_game")
+GAME_SIGNALS = _configured_signals("game")
+NON_CASUAL_GAME_SIGNALS = _configured_signals("non_casual_game")
+SHORT_DRAMA_SIGNALS = _configured_signals("short_drama")
+HARDWARE_SIGNALS = _configured_signals("hardware")
+CONSUMER_AI_HARDWARE_FORMS = _configured_signals("consumer_ai_hardware_forms")
+TARGET_AI_HARDWARE_SIGNALS = _configured_signals("target_ai_hardware")
+ENTERTAINMENT_WORLD_MODEL_CONTEXT = _configured_signals("entertainment_world_model_context")
+AI_CONTENT_SIGNALS = _configured_signals("ai_content")
+AI_GAME_APPLICATION_SIGNALS = _configured_signals("ai_game_application")
+TARGET_FINANCING_SIGNALS = _configured_signals("target_financing")
+SOCIAL_LITERATURE_SIGNALS = _configured_signals("social_literature")
+PRODUCT_ACTION_SIGNALS = _configured_signals("product_action")
+BUSINESS_EVIDENCE_SIGNALS = _configured_signals("business_evidence")
+OVERSEAS_SIGNALS = _configured_signals("overseas")
+HARD_OFF_TOPIC_SIGNALS = _configured_signals("hard_off_topic")
+
+
+def editorial_policy_name(config=None, requested=None):
+    """Return the explicit editorial profile; default stays legacy until accepted."""
+    if requested:
+        return requested.strip().lower()
+    env_value = os.environ.get(EDITORIAL_POLICY_ENV, "").strip()
+    if env_value:
+        return env_value.lower()
+    return str((config or {}).get("editorial_policy", {}).get("active_profile", "legacy")).lower()
+
+
+def resolve_editorial_policy(profile):
+    """Return one resolved test policy without duplicating decision logic.
+
+    v2 profiles inherit the common business_v1 signal vocabulary and only
+    change their selection threshold.  Keeping the inheritance here means
+    the fetcher, QA and tests all read the same policy document.
+    """
+    name = (profile or "legacy").lower()
+    if name in {"", "legacy", "off"}:
+        return {}
+    profiles = EDITORIAL_POLICY_DOCUMENT.get("profiles", {})
+    if name not in profiles:
+        raise ValueError(f"未知编辑策略：{profile}")
+    resolved = copy.deepcopy(profiles[name])
+    parent = resolved.pop("base_profile", None)
+    if parent:
+        base = resolve_editorial_policy(parent)
+        for key, value in resolved.items():
+            if isinstance(value, dict) and isinstance(base.get(key), dict):
+                base[key].update(value)
+            else:
+                base[key] = value
+        resolved = base
+    return resolved
+
+
+def is_test_editorial_profile(profile):
+    return (profile or "legacy").lower() in TEST_EDITORIAL_PROFILES
+
+
+def quality_gate_for_editorial_profile(config, profile):
+    """Merge the explicit profile's test thresholds over the base quality gate."""
+    config = config or {}
+    gate = dict(config.get("quality_gate", {}))
+    profile_gate = (
+        config.get("editorial_policy", {})
+        .get("profiles", {})
+        .get(profile, {})
+        .get("quality_gate", {})
+    )
+    gate.update(profile_gate)
+    return gate
+
+
+def _contains_any(text, needles):
+    t = (text or "").lower()
+    return any(needle in t for needle in needles)
+
+
+def is_consumer_ai_hardware(text):
+    t = (text or "").lower()
+    return (
+        _contains_any(t, CONSUMER_AI_HARDWARE_FORMS)
+        and _contains_any(t, TARGET_AI_HARDWARE_SIGNALS)
+    )
+
+
+def is_entertainment_world_model(text):
+    t = (text or "").lower()
+    return (
+        _contains_any(t, ("世界模型", "world model"))
+        and _contains_any(t, ENTERTAINMENT_WORLD_MODEL_CONTEXT)
+    )
+
+
+def _matched_signals(text, signals):
+    t = (text or "").lower()
+    hits = []
+    for signal in signals:
+        signal = str(signal).lower()
+        # Short ASCII fragments (AI/IP/PC) must be actual tokens.  Otherwise
+        # names such as Shania become accidental "AI" stories.
+        if re.fullmatch(r"[a-z0-9]{1,3}", signal):
+            if re.search(rf"(?<![a-z0-9]){re.escape(signal)}(?![a-z0-9])", t):
+                hits.append(signal)
+        elif signal in t:
+            hits.append(signal)
+    return hits
+
+
+def business_relevance_decision(text, profile="legacy", *, title=None, summary=None,
+                                multi_source_corroborated=False, multi_source_count=0):
+    """Return a structured accept/review/reject decision.
+
+    The test profile is multi-label and order-independent. A single broad
+    keyword can send an item to review, but cannot erase an otherwise
+    relevant product or business story.
+    """
+    normalized_profile = (profile or "legacy").lower()
+    if normalized_profile in {"", "legacy", "off"}:
+        return {
+            "decision": "accept", "score": 100, "reason": "legacy",
+            "confidence": 1.0, "labels": [], "primary_track": "",
+            "positive_evidence": [], "negative_evidence": [],
+        }
+    if normalized_profile in {"business_v2_strict", "business_v2_balanced", "business_v2_recall"}:
+        return business_v2_relevance_decision(
+            text, normalized_profile, title=title, summary=summary,
+            multi_source_corroborated=multi_source_corroborated,
+            multi_source_count=multi_source_count,
+        )
+    if normalized_profile != "business_v1_test":
+        raise ValueError(f"未知编辑策略：{profile}")
+
+    t = (text or "").lower()
+    # v1 is retained for historical regression only, but shares v2's
+    # non-negotiable subject safeguards.
+    if _v2_any(t, BUSINESS_V1_SIGNALS.get("unconfirmed_claim", [])):
+        return _v2_result("review", 25, "未证实模型/产品传闻", review_tier="hold",
+                          event_type="unconfirmed_claim")
+    # v1 is a frozen regression baseline: new v2-only “实测/榜单” wording
+    # must not silently alter its historical classification.
+    if _v2_any(t, BUSINESS_V1_SIGNALS.get("ai_training_low_value", [])) and _v2_training_only(t):
+        count = int(multi_source_count or (2 if multi_source_corroborated else 0))
+        if multi_source_corroborated and count >= 2:
+            return _v2_result("accept", 68, "多源确认的AI训练进展",
+                              labels=("AI模型与应用（娱乐向）",), event_type="corroborated_training")
+        return _v2_result("reject", 0, "低价值AI训练/评测/研究信息", event_type="training_or_evaluation")
+    if re.search(r"游戏.*(?:ceo|招聘|加班|外挂|反作弊|上市公司|半年报|市场报告)|游戏开发者讨论", t, re.I):
+        return _v2_result("reject", 0, "非目标游戏", event_type="out_of_scope")
+    if re.search(r"世界技能大赛|报告|调查|指数|审计|字节.*(?:营收|收入|利润)", t, re.I):
+        return _v2_result("review", 20, "非产品/业务事实资讯", review_tier="hold", event_type="report_or_opinion")
+    if re.search(r"法院|纠纷|争议|道歉", t, re.I):
+        return _v2_result("review", 20, "非产品/业务事实资讯", review_tier="hold", event_type="report_or_opinion")
+    thresholds = BUSINESS_V1_POLICY["thresholds"]
+    hard_confidence = float(thresholds["hard_reject_confidence"])
+    accept_confidence = float(thresholds["accept_confidence"])
+    review_confidence = float(thresholds["review_confidence"])
+    weights = BUSINESS_V1_POLICY["weights"]
+    labels, positive, negative, candidate_scores = [], [], [], []
+
+    def add_label(label, configured_weight, evidence):
+        if label not in labels:
+            labels.append(label)
+        candidate_scores.append(int(weights[configured_weight]))
+        positive.extend(evidence)
+
+    casual_hits = _matched_signals(t, CASUAL_GAME_SIGNALS)
+    game_hits = _matched_signals(t, GAME_SIGNALS)
+    non_casual_hits = _matched_signals(t, NON_CASUAL_GAME_SIGNALS)
+    short_hits = _matched_signals(t, SHORT_DRAMA_SIGNALS)
+    hardware_hits = _matched_signals(t, HARDWARE_SIGNALS)
+    ai_hits = _matched_signals(t, AI_CONTENT_SIGNALS)
+    ai_game_hits = _matched_signals(t, AI_GAME_APPLICATION_SIGNALS)
+    target_funding_hits = _matched_signals(t, TARGET_FINANCING_SIGNALS)
+    entertainment_hits = _matched_signals(t, SOCIAL_LITERATURE_SIGNALS)
+    hard_off_topic_hits = _matched_signals(t, HARD_OFF_TOPIC_SIGNALS)
+    product_hits = _matched_signals(t, PRODUCT_ACTION_SIGNALS)
+    evidence_hits = _matched_signals(t, BUSINESS_EVIDENCE_SIGNALS)
+    overseas_hits = _matched_signals(t, OVERSEAS_SIGNALS)
+
+    funding = is_funding_event(t)
+    ai_hardware = is_consumer_ai_hardware(t)
+    world_model = is_entertainment_world_model(t)
+
+    if casual_hits:
+        add_label("休闲游戏", "casual_game", casual_hits)
+    elif game_hits:
+        add_label("游戏待复核", "generic_game_review", game_hits)
+    if short_hits:
+        add_label("短剧/漫剧", "short_drama", short_hits)
+    if ai_hardware:
+        add_label("创新硬件（娱乐向）", "consumer_ai_hardware", hardware_hits)
+    if ai_hits or ai_game_hits or world_model:
+        add_label("AI模型与应用（娱乐向）", "ai_model_application", ai_hits + ai_game_hits)
+    if entertainment_hits:
+        add_label("泛娱乐业务", "entertainment_business", entertainment_hits)
+    if funding and target_funding_hits:
+        add_label("目标赛道融资", "target_financing", target_funding_hits)
+
+    score_value = max(candidate_scores or [0])
+    if product_hits:
+        score_value += int(weights["product_action_bonus"])
+        positive.extend(product_hits)
+    if evidence_hits:
+        score_value += int(weights["business_evidence_bonus"])
+        positive.extend(evidence_hits)
+    if overseas_hits:
+        score_value += int(weights["overseas_bonus"])
+        positive.extend(overseas_hits)
+    score_value = min(100, score_value)
+
+    hard_reason = ""
+    if short_hits and funding and not target_funding_hits:
+        hard_reason = "短剧漫剧融资非业务选题"
+        negative.extend(short_hits)
+    elif funding and not target_funding_hits and not ai_hits and not entertainment_hits:
+        # 事件类型比题材词更具体：融资新闻应先解释为“赛道不匹配”，
+        # 即使正文同时出现数据中心、芯片等硬排除词，结论仍然保持拒绝。
+        hard_reason = "非目标赛道融资"
+        negative.append("融资事件缺少目标赛道证据")
+    elif hard_off_topic_hits and not world_model:
+        hard_reason = "明确排除方向"
+        negative.extend(hard_off_topic_hits)
+    elif non_casual_hits and not ai_game_hits:
+        hard_reason = "非休闲游戏"
+        negative.extend(non_casual_hits)
+    elif hardware_hits and not ai_hardware and not ai_game_hits and not world_model:
+        hard_reason = "非AI消费者硬件"
+        negative.extend(hardware_hits)
+
+    if hard_reason:
+        return {
+            "decision": "reject",
+            "score": max(0, score_value - int(weights["hard_negative_penalty"])),
+            "reason": hard_reason, "confidence": hard_confidence, "labels": labels,
+            "primary_track": labels[0] if labels else "",
+            "positive_evidence": sorted(set(positive)),
+            "negative_evidence": sorted(set(negative)),
+        }
+
+    if not labels:
+        return {
+            "decision": "reject", "score": 0, "reason": "缺少业务相关性",
+            "confidence": hard_confidence, "labels": [], "primary_track": "",
+            "positive_evidence": [], "negative_evidence": [],
+        }
+
+    if funding and "目标赛道融资" in labels:
+        primary_reason = "目标赛道融资"
+    elif ai_hardware:
+        primary_reason = "AI消费者硬件"
+    elif (ai_game_hits and game_hits) or world_model:
+        primary_reason = "AI娱乐应用"
+    elif casual_hits:
+        primary_reason = "休闲游戏"
+    elif _v2_major_concrete_release(t):
+        primary_reason = "AI模型与应用"
+    elif short_hits:
+        primary_reason = "短剧漫剧业务动态"
+    elif ai_hits:
+        primary_reason = "AI模型与应用"
+    elif entertainment_hits:
+        primary_reason = "泛娱乐业务动态"
+    else:
+        primary_reason = "未证明为休闲游戏"
+
+    accept_score = int(thresholds["accept_score"])
+    review_score = int(thresholds["review_score"])
+    if score_value >= accept_score:
+        decision, reason, confidence = "accept", primary_reason, accept_confidence
+    elif score_value >= review_score:
+        decision, reason, confidence = "review", f"待复核：{primary_reason}", review_confidence
+    else:
+        decision, reason, confidence = "reject", "业务证据不足", hard_confidence
+
+    return {
+        "decision": decision, "score": score_value, "reason": reason,
+        "confidence": confidence, "labels": labels, "primary_track": labels[0],
+        "positive_evidence": sorted(set(positive)),
+        "negative_evidence": sorted(set(negative)),
+    }
+
+
+def clean_editorial_title(title):
+    """Remove feed/CSS debris before relevance and duplicate decisions."""
+    value = re.sub(r"(?:^|\s)\.css-[\w-]+\{[^}]*\}\s*", "", title or "")
+    return clean(value, 240)
+
+
+def editorial_text(title, summary=""):
+    """Keep article facts, not navigation or ad text, for the editor policy."""
+    body = re.sub(
+        r"(?:AI\s*芯片广告|导航|注册|TechCrunch\s+Brand\s+Studio)",
+        " ", summary or "", flags=re.I,
+    )
+    return clean(f"{clean_editorial_title(title)} {body}", 2000)
+
+
+def _v2_result(decision, score, reason, labels=(), *, review_tier=None,
+               event_type="", positive=(), negative=()):
+    result = {
+        "decision": decision, "score": int(score), "reason": reason,
+        "confidence": {"accept": 0.90, "review": 0.65, "reject": 0.90}[decision],
+        "labels": list(dict.fromkeys(labels)),
+        "primary_track": next(iter(labels), ""),
+        "positive_evidence": sorted(set(positive)),
+        "negative_evidence": sorted(set(negative)),
+        "event_type": event_type,
+    }
+    if decision == "review":
+        result["review_tier"] = review_tier or "hold"
+    return result
+
+
+def _v2_any(text, signals):
+    return bool(_matched_signals(text, signals))
+
+
+def _v2_subject_product_action(text, signals):
+    """Match launch verbs in a title without substring false positives.
+
+    In particular, the configured English word ``test`` must not match the
+    ``latest`` in an unrelated headline.  Chinese terms remain substring
+    matched because word boundaries do not exist in the same way.
+    """
+    value = (text or "").lower()
+    for raw in signals:
+        signal = str(raw).lower()
+        if re.fullmatch(r"[a-z ]+", signal):
+            if re.search(r"(?<![a-z])" + re.escape(signal) + r"(?![a-z])", value):
+                return True
+        elif signal and signal in value:
+            return True
+    return False
+
+
+def _v2_major_concrete_release(text):
+    policy = resolve_editorial_policy("business_v2_strict")
+    signals = policy["signals"]
+    named = _v2_any(text, signals["major_model_family"])
+    lab = _v2_any(text, signals["major_ai_lab"])
+    action = bool(re.search(r"发布|推出|上线|开放|开源|launch|release|ship", text, re.I))
+    return named and lab and action
+
+
+def _v2_named_model_release(text):
+    """A concrete model version actually launched, not a training result.
+
+    This intentionally permits a named release from a non-head lab as a
+    reviewable/usable model fact.  The training gate still handles research,
+    benchmark and small-model experiments separately.
+    """
+    if not re.search(r"发布|推出|上线|开放|开源|launch|release|ship", text, re.I):
+        return False
+    has_model_word = bool(re.search(r"模型|model", text, re.I))
+    has_version = bool(re.search(
+        r"(?:[A-Za-z][A-Za-z0-9_-]*\d[\w.-]*|[A-Za-z][A-Za-z0-9_-]*\s+\d+(?:\s+[A-Za-z]+)?|\d+(?:\.\d+){1,})",
+        text,
+    ))
+    return has_model_word and has_version
+
+
+def _v2_body_confirmed_ai_model_release(subject, all_text):
+    """Recognise a named AI model release proved by the article body.
+
+    Headlines are often written as a trend, a usage observation or a question
+    and omit “发布/上线”.  That must not erase a concrete launch which the
+    captured article text clearly states.  This is deliberately narrower than
+    a generic “a named model showed a capability” exception: it requires a
+    release action, a model form and a user or developer-facing fact.
+    It therefore cannot promote a security test, a benchmark or a policy
+    discussion merely because Gemini/OpenAI/AI appears in the story.
+    """
+    if not re.search(
+        r"(?<![a-z])ai(?![a-z])|人工智能|大模型|模型|model|智能体|agent|"
+        r"openai|anthropic|google|谷歌|meta|字节|腾讯|阿里",
+        subject,
+        re.I,
+    ):
+        return False
+    # This body-evidence fallback is for a launch obscured by a trend-style
+    # headline, not a way to promote model leaderboards or benchmark writeups.
+    # Explicitly titled launches remain covered by the established release
+    # branches above; this narrow fallback must stay clear of evaluation news.
+    if re.search(r"跑分|榜单|排行榜|竞技场|评测|测评|基准测试|benchmark|evaluation", all_text, re.I):
+        return False
+    if not re.search(r"发布|推出|上线|开放|开源|launch(?:es|ed)?|release(?:s|d)?|ships?", all_text, re.I):
+        return False
+    if not re.search(r"模型|model", all_text, re.I):
+        return False
+    if not re.search(r"开发者|用户|接入|使用|浏览器|任务|创作者|developers?|users?|integrat|use", all_text, re.I):
+        return False
+    # Avoid turning a generic “AI 产品发布” paragraph into a named event.
+    # Python's ``\b`` treats Chinese characters as word characters, so a
+    # name such as “Jev爆火” has no trailing word boundary.  Use ASCII-aware
+    # boundaries for Latin product names embedded in Chinese headlines.
+    return bool(re.search(r"(?<![a-z0-9])[a-z][a-z0-9_-]{2,}(?![a-z0-9])|[\u4e00-\u9fff]{2,}模型", subject, re.I))
+
+
+def _v2_training_only(text, subject=None):
+    policy = resolve_editorial_policy("business_v2_strict")
+    signals = policy["signals"]
+    subject = subject or text
+    ai_context_pattern = r"(?<![a-z])ai(?![a-z])|人工智能|大模型|llm|模型|model|代码|开发者"
+    # A training/benchmark gate is about what the article is *about*, not a
+    # stray AI phrase in a short-drama, game or platform-business body.  The
+    # subject therefore has to identify an AI/model/engineering topic before
+    # a body-side ranking or test word can activate this narrow exclusion.
+    subject_has_ai_context = bool(re.search(ai_context_pattern, subject, re.I))
+    subject_has_training_signal = _v2_any(subject, signals["ai_training_low_value"])
+    measurement = bool(re.search(
+        r"训练|预训练|后训练|微调|评测|测评|实测|跑分|benchmark|evaluation|竞技场|排行榜|榜单",
+        text,
+        re.I,
+    )) and subject_has_ai_context
+    if not (subject_has_training_signal or measurement):
+        return False
+    # Product release, consumer function and target creation use cases are not
+    # converted into research merely because their copy mentions "测试".
+    if _v2_major_concrete_release(subject):
+        return False
+    # A versioned release whose headline is itself about a target creation
+    # application is a product/model launch, not a small-lab training result.
+    # Generic OCR, benchmark and research releases remain behind this gate.
+    if (
+        _v2_any(subject, signals["ai_target_application"])
+        and _v2_named_model_release(subject)
+    ):
+        return False
+    if (
+        _v2_any(subject, signals["ai_target_application"])
+        and not measurement
+        and re.search(r"发布|推出|上线|开放|内测|公测|支持|launch|release", subject, re.I)
+    ):
+        return False
+    return True
+
+
+def _v2_target_financing(text):
+    policy = resolve_editorial_policy("business_v2_strict")
+    signals = policy["signals"]
+    if _v2_any(text, signals["target_financing"]):
+        return True
+    return bool(
+        (_v2_any(text, signals["ai_general_product"]) and _v2_any(text, signals["user_facing_context"]))
+        or (_v2_any(text, signals["ai_content"]) and _v2_any(text, signals["user_facing_context"]))
+        or ("world model" in text and ("interactive" in text or "video generation" in text))
+    )
+
+
+def _v2_profile_decision(profile, score, *, default="review", tier="high"):
+    """Profiles differ only in how far a *safe review* may expand.
+
+    Explicit rejections never reach this function.  This deliberately avoids
+    the former generic "target application / multi-source" prerequisite.
+    """
+    if profile == "business_v2_strict":
+        return "accept" if score >= 65 else default
+    if profile == "business_v2_balanced":
+        return "accept" if score >= 54 else default
+    return "accept" if score >= 40 else default
+
+
+def business_v2_relevance_decision(text, profile, *, title=None, summary=None,
+                                   multi_source_corroborated=False, multi_source_count=0):
+    """Central v2 policy: hard-delete only explicit out-of-scope material.
+
+    AI product/model news is evaluated on its own facts.  Multi-source support
+    is an exception for a small training/evaluation event, never a general
+    prerequisite for ordinary product, model, hardware or financing news.
+    """
+    if profile not in {"business_v2_strict", "business_v2_balanced", "business_v2_recall"}:
+        raise ValueError(f"未知编辑策略：{profile}")
+    policy = resolve_editorial_policy(profile)
+    signals = policy["signals"]
+    title = clean_editorial_title(title or text or "")
+    summary = summary if summary is not None else text or ""
+    all_text = editorial_text(title, summary).lower()
+    subject = title.lower() or all_text
+    labels, positive, negative = [], [], []
+
+    casual = _v2_any(all_text, signals["casual_game"])
+    game = _v2_any(all_text, signals["game"])
+    game_subject = _v2_any(subject, signals["game"])
+    non_casual = _v2_any(all_text, signals["non_casual_game"])
+    short_drama = _v2_any(all_text, signals["short_drama"])
+    # A model article may mention devices, servers or chips in its body.  A
+    # hardware hard-delete must be based on the article subject, otherwise it
+    # turns a product/model story into an unrelated hardware story.
+    hardware = _v2_any(subject, signals["hardware"])
+    body_hardware = _v2_any(all_text, signals["hardware"])
+    ai = _v2_any(all_text, signals["ai_content"])
+    subject_ai = _v2_any(subject, signals["ai_content"])
+    ai_game = _v2_any(all_text, signals["ai_game_application"])
+    product_action = _v2_any(all_text, signals["product_action"])
+    # Feed bodies can contain navigation, conference advertising or related
+    # links.  Such boilerplate must not turn an AI discussion into a product
+    # launch.  Automatic product admission therefore needs an action in the
+    # article subject; body-only evidence remains reviewable below.
+    subject_product_action = _v2_subject_product_action(subject, signals["product_action"])
+    business_evidence = _v2_any(all_text, signals["business_evidence"])
+    overseas = _v2_any(all_text, signals["overseas"])
+    funding = is_funding_event(all_text)
+    ai_hardware = is_consumer_ai_hardware(subject)
+    emerging_device = (
+        _v2_any(all_text, signals.get("emerging_ai_device_forms", []))
+        and _v2_any(all_text, signals["target_ai_hardware"])
+        and _v2_any(all_text, signals.get("consumer_launch_evidence", []))
+    )
+    world_model = is_entertainment_world_model(all_text)
+    hard_off_topic = _v2_any(all_text, signals["hard_off_topic"])
+
+    # These are the only irrevocable exclusions.  They are fact/topic based,
+    # not single broad keywords such as AI, hardware or financing.
+    target_app = _v2_any(all_text, signals["ai_target_application"])
+    subject_target_app = _v2_any(subject, signals["ai_target_application"])
+    # Determine this from the headline before applying game exclusions.  Model
+    # releases frequently use terms such as "open world" in their body, but
+    # that does not make the article a non-casual game story.
+    named_model_release = (
+        _v2_major_concrete_release(subject) or _v2_named_model_release(subject)
+    )
+    head_ai_company = bool(re.search(r"openai|anthropic|google|谷歌|阿里|腾讯|字节|meta", subject, re.I))
+    target_funding = (
+        _v2_target_financing(all_text)
+        or (funding and world_model)
+        or (funding and subject_target_app and ai)
+        or (funding and head_ai_company)
+    )
+    # A digest containing several unrelated headlines cannot borrow relevance
+    # from its last clause.  Preserve it for audit, but do not publish it as a
+    # single Anthropic/OpenAI item.
+    if subject.count("；") >= 2 or subject.count("|") >= 2:
+        return _v2_result("review", 15, "聚合快讯主题不单一，保留人工复核", review_tier="hold",
+                          event_type="mixed_digest")
+    if funding and not target_funding:
+        return _v2_result("reject", 0, "非目标赛道融资", negative=("融资缺少目标产品证据",))
+    if short_drama and funding and not target_funding:
+        return _v2_result("reject", 0, "短剧漫剧融资非业务选题", negative=("融资缺少产品/发行/海外业务",))
+    if hard_off_topic and not (world_model or ai_hardware or emerging_device):
+        return _v2_result("reject", 0, "明确排除方向", negative=_matched_signals(all_text, signals["hard_off_topic"]))
+    # Route confirmed target financing before incidental console/game words.
+    # A family motion-entertainment device can mention Xbox as a sales
+    # comparison without becoming a console-game story.  Explicit OUT sectors
+    # have already been rejected above.
+    if funding and target_funding:
+        labels = ["目标赛道融资"]
+        if ai or ai_hardware or world_model or emerging_device:
+            labels.append("AI模型与应用（娱乐向）")
+        return _v2_result("accept", 76, "目标赛道融资", labels=labels,
+                          event_type="target_financing")
+    if non_casual and not ai_game and not named_model_release:
+        return _v2_result("reject", 0, "非休闲游戏", negative=_matched_signals(all_text, signals["non_casual_game"]))
+    spatial_ai_hardware = hardware and ai and bool(re.search(r"\b(?:ar|vr)\b|空间", all_text, re.I))
+    if hardware and not (ai_hardware or spatial_ai_hardware or emerging_device or world_model or ai_game):
+        return _v2_result("reject", 0, "非AI消费者硬件", negative=("普通硬件",))
+    # A consumer-device/brand profile may name its category only in the body
+    # (for example an ordinary speaker brand), while the title is a marketing
+    # slogan.  It is still an explicit ordinary-hardware exclusion unless the
+    # subject itself is an AI/model story or a permitted AI device.
+    if body_hardware and not subject_ai and not (ai_hardware or spatial_ai_hardware or emerging_device):
+        return _v2_result("reject", 0, "非AI消费者硬件", negative=("普通硬件",))
+
+    # Feed category labels such as “商业 #Anthropic” carry no publishable
+    # fact.  Keep them visible for traceability, not as a selected headline.
+    if re.fullmatch(r"(?:商业|游戏|3c)?\s*#\s*[^#]{2,40}", subject, re.I):
+        return _v2_result("review", 15, "标题缺少可核验事实，保留人工复核", review_tier="hold",
+                          event_type="low_information_title")
+
+    # Reports, policies and opinions remain reviewable for audit but never
+    # auto-selected.  They must not masquerade as training items.
+    # Training / benchmark is a narrow rule.  It can pass only when it is the
+    # same concrete model event independently confirmed by the required number
+    # of publishers.  A head vendor's *actual release* was already exempted.
+    if _v2_training_only(all_text, subject):
+        required = int(policy.get("ai_evidence", {}).get("multi_source_min", 2))
+        count = int(multi_source_count or (required if multi_source_corroborated else 0))
+        if multi_source_corroborated and count >= required:
+            return _v2_result("accept", 68, "多源确认的AI训练进展",
+                              labels=("AI模型与应用（娱乐向）",),
+                              event_type="corroborated_training", positive=(f"独立来源{count}个",))
+        return _v2_result("reject", 0, "低价值AI训练/评测/研究信息",
+                          event_type="training_or_evaluation")
+
+    if re.search(r"报告|调查|指数|审计|监管|政策|法院|纠纷|评论|观点|分析师|大摩|高盛|投行|券商|投研|report|survey|audit|policy", subject, re.I):
+        return _v2_result("review", 20, "非产品/业务事实资讯", review_tier="hold",
+                          event_type="report_or_opinion")
+
+    if casual:
+        return _v2_result("accept", 78, "休闲游戏", labels=("休闲游戏",),
+                          event_type="casual_game", positive=_matched_signals(all_text, signals["casual_game"]))
+
+    # Conference/award notices are not product or market developments by
+    # themselves.  A concrete product, ranking or business datum can still
+    # pass through the specialised branches below.
+    if re.search(r"大会|峰会|对接会|论坛|奖池|奖金|征集|活动", subject, re.I) and not business_evidence:
+        return _v2_result("review", 20, "行业活动通知，保留人工复核", review_tier="hold",
+                          event_type="industry_event")
+
+    # A concrete release must win over incidental short-drama wording in the
+    # body (for example, a model used for dubbing a short drama).
+    if named_model_release:
+        return _v2_result("accept", 75, "AI模型与应用", labels=("AI模型与应用（娱乐向）",),
+                          event_type="major_model_release")
+
+    # Enterprise-cloud, energy and vertical-industry deployment material is
+    # useful background but not a consumer/content/entertainment AI product.
+    # Keep it visible to an editor without allowing the broader profiles to
+    # use it to fill their quota.
+    if _v2_any(subject, signals.get("enterprise_infrastructure_subject", [])):
+        return _v2_result("review", 25, "企业/基础设施AI资讯，保留人工复核", review_tier="hold",
+                          event_type="enterprise_infrastructure")
+
+    # The title may describe adoption or popularity rather than the launch
+    # itself.  When the captured article body independently confirms a named
+    # product/model release and its concrete user/developer use, this is a
+    # publishable product fact.  Do not rely on a title-only launch verb.
+    if _v2_body_confirmed_ai_model_release(subject, all_text):
+        return _v2_result("accept", 68, "正文证实的AI模型发布",
+                          labels=("AI模型与应用（娱乐向）",),
+                          event_type="body_confirmed_ai_model_release")
+
+    # This is a positive, narrow business signal rather than a broad AI
+    # exception: the subject must identify an AI attribution/advertising/
+    # growth product *and* a concrete product change.  It implements the
+    # editorial priority for AI marketing and growth tooling without admitting
+    # market reports or generic advertising commentary.
+    growth_update = bool(re.search(
+        r"新增|升级|扩展|推出|发布|上线|开放|支持|expands?|adds?|introduces?|launch(?:es|ed)?|updates?",
+        subject, re.I,
+    ))
+    if subject_ai and growth_update and _v2_any(subject, signals.get("ai_growth_product_subject", [])):
+        return _v2_result("accept", 72, "AI营销/增长工具", labels=("AI模型与应用（娱乐向）",),
+                          event_type="ai_growth_product")
+
+    # Short-drama / comics coverage is useful when it tells us about overseas
+    # product, hit, ranking or commercial movement.  It is not rescued merely
+    # because it contains the word short drama, and pure financing is still
+    # handled by the preceding funding rule.
+    if short_drama and (overseas or product_action or business_evidence):
+        return _v2_result("accept", 74, "短剧漫剧业务动态", labels=("短剧/漫剧",),
+                          event_type="short_drama_business")
+
+    platform = _v2_any(all_text, signals["platform_business_anchor"])
+    subject_platform = _v2_any(subject, signals["platform_business_anchor"])
+    commerce_actor = _v2_any(subject, signals.get("pure_crossborder_commerce_actor", []))
+    business_evidence = _v2_any(all_text, signals["business_evidence"])
+    overseas = _v2_any(all_text, signals["overseas"])
+    pure_commerce_subject = bool(re.search(r"电商|e-?commerce|shop|卖货|带货|gmv|店铺|商家", subject, re.I))
+    if subject_platform and (commerce_actor or pure_commerce_subject) and not subject_product_action:
+        return _v2_result("reject", 0, "纯跨境电商品牌/卖货", event_type="out_of_scope")
+    platform_overseas = overseas or bool(re.search(r"美区|美服|北美|美国市场|us\b|u\.s\.", subject, re.I))
+    if subject_platform and platform_overseas and business_evidence:
+        # Overseas platform product and monetisation moves (for example
+        # TikTok's shopping or creator-product changes) are target social /
+        # outbound business information even when AI is not the article's
+        # subject.  Requiring an incidental AI word here silently dropped them.
+        return _v2_result("accept", 72, "平台业务动态", labels=("社交·Dating",),
+                          event_type="platform_business")
+
+    # A large AI company's disclosed financial trajectory is strategically
+    # useful; it is neither generic financing nor an infrastructure story.
+    if head_ai_company and re.search(
+        r"现金|cash burn|收入|营收|revenue|预测|forecast|ipo|上市|估值|融资", subject, re.I
+    ):
+        return _v2_result("accept", 72, "头部AI公司财务动态",
+                          labels=("AI模型与应用（娱乐向）",), event_type="major_ai_financial")
+
+    if ai_hardware or spatial_ai_hardware:
+        labels = ["创新硬件（娱乐向)"]
+        # Correct typo retained nowhere in downstream labels.
+        labels = ["创新硬件（娱乐向）", "AI模型与应用（娱乐向）"] if ai else labels
+        return _v2_result("accept", 78, "AI消费者硬件", labels=labels,
+                          event_type="consumer_ai_hardware")
+    if emerging_device:
+        return _v2_result("review", 52, "新形态AI消费者硬件待核", labels=("创新硬件（娱乐向）",),
+                          review_tier="high", event_type="consumer_ai_hardware")
+
+    if world_model or ai_game:
+        return _v2_result("accept", 74, "AI娱乐应用", labels=("AI模型与应用（娱乐向）",),
+                          event_type="target_ai_application")
+    if _v2_any(subject, signals.get("unconfirmed_claim", [])):
+        return _v2_result("review", 25, "未证实模型/产品传闻", labels=("AI模型与应用（娱乐向）",),
+                          review_tier="hold", event_type="unconfirmed_claim")
+    general_product = _v2_any(all_text, signals["ai_general_product"])
+    user_facing = _v2_any(all_text, signals["user_facing_context"])
+    if subject_target_app and subject_product_action:
+        return _v2_result("accept", 70, "AI模型与应用", labels=("AI模型与应用（娱乐向）",),
+                          event_type="target_ai_application")
+    named_agent_feature = bool(re.search(r"\bai\s+agents?\b|智能体", all_text, re.I)) and bool(re.search(r"call|电话|通话", all_text, re.I))
+    if (
+        (general_product or named_agent_feature or (ai and user_facing and subject_product_action))
+        and (user_facing or named_agent_feature)
+        and (subject_ai or subject_target_app or named_agent_feature)
+    ):
+        return _v2_result("review", 50, "用户向AI产品待扩展", labels=("AI模型与应用（娱乐向）",),
+                          review_tier="high", event_type="product_or_feature_release")
+
+    # This is intentionally a review tier, not an admission prerequisite:
+    # a named consumer-facing AI product can be useful even when the headline
+    # has no literal “发布/上线” verb.  Balanced may use this safer review
+    # tier; recall can additionally inspect the broader medium tier.
+    subject_user_application = _v2_any(
+        subject, signals.get("consumer_ai_application_subject", [])
+    )
+    body_proven_head_app = (
+        head_ai_company
+        and _v2_any(all_text, signals.get("consumer_ai_application_subject", []))
+        and ai
+    )
+    if (subject_ai or head_ai_company) and (subject_user_application or body_proven_head_app) and subject_product_action:
+        return _v2_result("review", 52, "具名用户向AI产品待扩展", labels=("AI模型与应用（娱乐向）",),
+                          review_tier="high", event_type="product_or_feature_release")
+
+    if game_subject:
+        if re.search(r"(?:ceo|招聘|加班|外挂|反作弊|上市公司|半年报|市场报告|游戏开发者讨论)", all_text, re.I):
+            return _v2_result("reject", 0, "非目标游戏", event_type="out_of_scope")
+        # Mobile-game revenue/download/player-spending/ranking data is useful
+        # business evidence.  It is not an AI benchmark.  Keep it as a high
+        # review so balanced/recall may use it after body and shared-audit
+        # checks while strict does not auto-admit an unknown game genre.
+        mobile_market_data = bool(re.search(
+            r"手游|移动游戏|mobile games?|player spending|consumer spending|"
+            r"revenue|收入|流水|下载|downloads?|市场份额|market share",
+            all_text, re.I,
+        )) and business_evidence
+        if product_action and (business_evidence or overseas):
+            score = 58
+            decision = _v2_profile_decision(profile, score)
+            return _v2_result(decision, score, "休闲玩法未明确", labels=("游戏待复核",),
+                              review_tier="high", event_type="generic_game")
+        if mobile_market_data:
+            return _v2_result("review", 52, "移动游戏市场数据待扩展", labels=("游戏待复核",),
+                              review_tier="high", event_type="game_market_data")
+        return _v2_result("review", 32, "休闲玩法未明确", labels=("游戏待复核",),
+                          review_tier="hold", event_type="generic_game")
+
+    # A genuine named/product AI story may be visible to a human editor even
+    # if it is not in a prescribed target subcategory.  It is never a hard
+    # reject merely for being single-source.
+    if subject_ai and subject_product_action:
+        return _v2_result("review", 38, "AI产品信息待复核", labels=("AI模型与应用（娱乐向）",),
+                          review_tier="medium", event_type="product_or_feature_release")
+    if _v2_any(subject, signals["social_literature"]) and (overseas or product_action or business_evidence):
+        return _v2_result("accept", 66, "泛娱乐业务动态", labels=("泛娱乐业务",),
+                          event_type="entertainment_business")
+    if ai:
+        # AI only in a paragraph of background is not a business fact to
+        # publish, but it is deliberately retained for audit rather than
+        # treated as a hard rejection.
+        return _v2_result("review", 15, "AI并非文章主体，保留人工复核", review_tier="hold",
+                          event_type="incidental_ai_context")
+    return _v2_result("reject", 0, "缺少业务相关性", event_type="out_of_scope")
+
+
+def profile_selects_complete_review(decision, content_status, profile):
+    if decision.get("decision") != "review" or content_status != "complete":
+        return False
+    config = resolve_editorial_policy(profile).get("selection", {})
+    if not config.get("auto_include_complete_review", False):
+        return False
+    if int(decision.get("score", 0)) < int(config.get("min_review_score", 0)):
+        return False
+    return decision.get("review_tier", "high") in set(config.get("allowed_review_tiers", ["high"]))
+
+
+def same_ai_training_event(left, right):
+    """Strictly identify one small-model training event from distinct publishers."""
+    if not left or not right or left.get("src") == right.get("src"):
+        return False
+    if normalize_url(left.get("link", "")) == normalize_url(right.get("link", "")):
+        return False
+    # The event identity must be visible in both headlines.  Looking for a
+    # shared model token anywhere in the full body is unsafe: an OceanBase
+    # benchmark article and an unrelated Jev explainer can both mention
+    # GLM-5.2 as background and would otherwise become false corroboration.
+    left_title = clean_editorial_title(left.get("title", "")).lower()
+    right_title = clean_editorial_title(right.get("title", "")).lower()
+    anchor_pattern = (
+        r"(?:gpt|claude|gemini|qwen|llama|deepseek|grok|ernie|glm|kimi|"
+        r"minimax|internlm|zgcm|书生)[a-z0-9.-]*"
+    )
+    left_anchors = {anchor.lower() for anchor in re.findall(anchor_pattern, left_title, re.I)}
+    right_anchors = {anchor.lower() for anchor in re.findall(anchor_pattern, right_title, re.I)}
+    shared_anchors = left_anchors & right_anchors
+    if not shared_anchors:
+        return False
+    title_overlap = sig_tokens(left_title) & sig_tokens(right_title)
+    anchor_tokens = set().union(*(sig_tokens(anchor) for anchor in shared_anchors))
+    if len(title_overlap - anchor_tokens) < 2:
+        return False
+    a = editorial_text(left.get("title", ""), left.get("summary", "")).lower()
+    b = editorial_text(right.get("title", ""), right.get("summary", "")).lower()
+    if re.search(r"报告|调查|指数|审计|report|survey|audit", a + b, re.I):
+        return False
+    if not (_v2_training_only(a) and _v2_training_only(b)):
+        return False
+    training_actions = (
+        r"训练|预训练|后训练|微调|开源|发布|上线|评测|测评|跑分|榜单|"
+        r"train(?:ed|ing)?|fine[ -]?tun(?:e|ed|ing)|open[ -]?source|releas(?:e|ed)|"
+        r"launch(?:ed)?|benchmark|evaluation"
+    )
+    left_actions = {m.group(0).lower() for m in re.finditer(training_actions, a, re.I)}
+    right_actions = {m.group(0).lower() for m in re.finditer(training_actions, b, re.I)}
+    return bool(left_actions & right_actions)
+
+
+def snapshot_training_source_counts(records):
+    """Count distinct publishers for exact training events in one snapshot."""
+    counts = {}
+    for record in records or []:
+        item = record.get("item", {}) or {}
+        key = normalize_url(item.get("link", ""))
+        if not key:
+            continue
+        publisher = str(item.get("src", "")).strip().casefold()
+        publishers = {publisher} if publisher else set()
+        for other_record in records:
+            other = other_record.get("item", {}) or {}
+            if not same_ai_training_event(item, other):
+                continue
+            other_publisher = str(other.get("src", "")).strip().casefold()
+            if other_publisher:
+                publishers.add(other_publisher)
+        counts[key] = len(publishers)
+    return counts
+
+
+def same_run_named_launch_event(left, right):
+    """Merge a named launch only with enough title-level evidence.
+
+    A bare shared model name is unsafe: two same-day GPT stories can be about
+    unrelated topics.  Require different publishers, the same concrete model
+    anchor in both titles, and meaningful title overlap beyond that anchor.
+    """
+    if not left or not right or left.get("src") == right.get("src"):
+        return False
+    if normalize_url(left.get("link", "")) == normalize_url(right.get("link", "")):
+        return False
+    a_title = clean_editorial_title(left.get("title", "")).lower()
+    b_title = clean_editorial_title(right.get("title", "")).lower()
+    anchors = re.findall(
+        r"(?:gpt|claude|gemini|qwen|llama|deepseek|grok|ernie|glm|kimi|minimax|internlm|zgcm|specs)[a-z0-9.-]*",
+        a_title,
+        re.I,
+    )
+    shared_anchors = [anchor.lower() for anchor in anchors if anchor.lower() in b_title]
+    if not shared_anchors:
+        return False
+    overlap = sig_tokens(a_title) & sig_tokens(b_title)
+    anchor_tokens = set().union(*(sig_tokens(anchor) for anchor in shared_anchors))
+    both_announce = all(re.search(r"发布|推出|上线|开放|开源|亮相|launch|release|ship", value, re.I)
+                        for value in (a_title, b_title))
+    return len(overlap - anchor_tokens) >= 2 or both_announce
+
+
+def same_run_body_confirmed_model_release(left, right):
+    """Merge duplicate same-publisher coverage of one named model launch.
+
+    The duplicate rule is intentionally stricter than a shared company name:
+    both articles must independently meet the body-confirmed release test and
+    name the same non-generic Latin model/product anchor.  This keeps two
+    genuinely different same-day updates from a publisher separate while
+    preventing two explanatory Jev articles from consuming two places.
+    """
+    if not left or not right or left.get("src") != right.get("src"):
+        return False
+    if normalize_url(left.get("link", "")) == normalize_url(right.get("link", "")):
+        return True
+    left_title = clean_editorial_title(left.get("title", "")).lower()
+    right_title = clean_editorial_title(right.get("title", "")).lower()
+    left_text = editorial_text(left.get("title", ""), left.get("summary", "")).lower()
+    right_text = editorial_text(right.get("title", ""), right.get("summary", "")).lower()
+    if not (
+        _v2_body_confirmed_ai_model_release(left_title, left_text)
+        and _v2_body_confirmed_ai_model_release(right_title, right_text)
+    ):
+        return False
+    ignored = {"openai", "google", "meta", "model", "models", "agent", "agents"}
+    def anchors(value):
+        return {
+            token.lower()
+            for token in re.findall(r"(?<![a-z0-9])[a-z][a-z0-9_-]{2,}(?![a-z0-9])", value, re.I)
+            if token.lower() not in ignored
+        }
+    return bool(anchors(left_title) & anchors(right_title))
+
+
+def _v2_major_finance_fingerprint(item):
+    """Return a conservative company + financial-event fingerprint.
+
+    This is intentionally narrower than ordinary semantic similarity.  It is
+    used only to merge two independent reports of the same named company's
+    cash-burn / IPO / disclosed-revenue event.
+    """
+    title = clean_editorial_title((item or {}).get("title", "")).lower()
+    full = editorial_text(title, (item or {}).get("summary", "")).lower()
+    company = next((name for name in ("openai", "anthropic", "google", "谷歌", "字节", "腾讯", "阿里")
+                    if name in title), "")
+    if not company:
+        return None
+    if re.search(r"现金|cash burn|free cash flow|自由现金流", title, re.I):
+        kind = "cash"
+    elif re.search(r"ipo|上市|挂牌|路演", title, re.I):
+        kind = "ipo"
+    elif re.search(r"年化收入|营收|revenue|收入预测", title, re.I):
+        kind = "revenue"
+    else:
+        return None
+    years = set(re.findall(r"20\d{2}", full))
+    amounts = []
+    for raw in re.findall(r"(\d+(?:\.\d+)?)\s*(?:billion|bn|亿美元|亿(?:美元)?)", full, re.I):
+        try:
+            amounts.append(float(raw))
+        except ValueError:
+            pass
+    return company, kind, years, amounts
+
+
+def same_run_major_financial_event(left, right):
+    """Merge only independently published, demonstrably same finance events."""
+    if not left or not right or left.get("src") == right.get("src"):
+        return False
+    if normalize_url(left.get("link", "")) == normalize_url(right.get("link", "")):
+        return False
+    a, b = _v2_major_finance_fingerprint(left), _v2_major_finance_fingerprint(right)
+    if not a or not b or a[:2] != b[:2]:
+        return False
+    if a[2] & b[2]:
+        return True
+    for first in a[3]:
+        for second in b[3]:
+            if max(first, second) and abs(first - second) / max(first, second) <= 0.15:
+                return True
+    return False
+
+
+def route_editorial_candidate(text, decision, fallback_board=None, fallback_track=None):
+    labels = set(decision.get("labels", []))
+    if fallback_board and decision.get("decision") == "reject":
+        return fallback_board, fallback_track
+    if "目标赛道融资" in labels and is_funding_event(text):
+        return "全球融资", "泛AI·AI应用融资" if labels & {"AI模型与应用（娱乐向）", "创新硬件（娱乐向）"} else "泛娱乐融资"
+    if "创新硬件（娱乐向）" in labels:
+        return "创新·AI娱乐", "创新硬件（娱乐向）"
+    if "AI模型与应用（娱乐向）" in labels:
+        return "创新·AI娱乐", "AI模型与应用（娱乐向）"
+    if "短剧/漫剧" in labels:
+        return "泛娱乐·出海", "短剧/漫剧"
+    if labels & {"休闲游戏", "游戏待复核"}:
+        return "泛娱乐·出海", "休闲游戏"
+    return fallback_board, fallback_track
+
+
+def select_ranked_track_items(items, limit, profile="legacy"):
+    """Rank with a soft per-source rotation so one feed cannot crowd a track."""
+    ranked = sorted(items, key=lambda item: (
+        -int(item.get("_editorial_decision", {}).get("score", item.get("score", 0))),
+        -int(item.get("score", 0)), item.get("title", ""),
+    ))
+    selected, rest, used = [], [], set()
+    for item in ranked:
+        source = item.get("src", "")
+        if len(selected) < limit and source not in used:
+            selected.append(item); used.add(source)
+        else:
+            rest.append(item)
+    for item in list(rest):
+        if len(selected) >= limit:
+            break
+        selected.append(item); rest.remove(item)
+    return selected, rest
+
+
+def business_relevance(text, profile="legacy"):
+    """Compatibility wrapper returning accepted and reason.
+
+    Review items remain visible to independent QA instead of being silently
+    deleted. Candidate assembly uses the structured decision to keep them out
+    of the automatic selected pool until explicitly reviewed.
+    """
+    result = business_relevance_decision(text, profile)
+    return result["decision"] != "reject", result["reason"]
+
+
+def quality_gate_limit(quality_gate, key):
+    """Read one required threshold from sources.yaml, with an explicit env override."""
+    env_name = QUALITY_GATE_ENV[key]
+    if env_name in os.environ:
+        return int(os.environ[env_name])
+    if key not in quality_gate:
+        raise ValueError(f"sources.yaml missing config.quality_gate.{key}")
+    return int(quality_gate[key])
+
+
+def coverage_gate_failures(total_selected, selected_source_count, public_failure_count, quality_gate):
+    """Return deterministic public-source coverage failures for the daily gate."""
+    minimum_candidates = quality_gate_limit(quality_gate, "min_selected_candidates")
+    minimum_sources = quality_gate_limit(quality_gate, "min_selected_sources")
+    maximum_failures = quality_gate_limit(quality_gate, "max_failed_public_sources")
+    failures = []
+    if total_selected < minimum_candidates:
+        failures.append(f"精选候选仅 {total_selected} 条，低于门禁 {minimum_candidates} 条")
+    if selected_source_count < minimum_sources:
+        failures.append(f"精选仅覆盖 {selected_source_count} 个来源，低于门禁 {minimum_sources} 个")
+    if public_failure_count > maximum_failures:
+        failures.append(f"公开源失败 {public_failure_count} 个，超过门禁 {maximum_failures} 个")
+    return failures
+
+
+def public_selection_stats(selected_items, enabled_public_sources):
+    """Count selected public items and distinct registered public sources."""
+    enabled = set(enabled_public_sources)
+    public_items = [
+        item for item in selected_items if item.get("_registry_source") in enabled
+    ]
+    return len(public_items), len({item["_registry_source"] for item in public_items})
 
 
 def normalize_url(url):
@@ -248,6 +1306,23 @@ def extract_entities(title, text):
     return entities
 
 
+def extract_product_anchors(title, text=""):
+    """Extract explicit product/work names for conservative cross-source dedup."""
+    anchors = set()
+    hay = f"{title or ''} {(text or '')[:300]}"
+    patterns = (
+        r"《([^》]{2,60})》",
+        r"[“\"]([^”\"]{2,60})[”\"]",
+        r"[‘']([^’']{2,60})[’']",
+    )
+    for pattern in patterns:
+        for raw in re.findall(pattern, hay):
+            key = _norm_entity(raw)
+            if key:
+                anchors.add(key)
+    return anchors
+
+
 def _money_value(num, mult):
     try:
         return str(int(round(float(num) * mult)))
@@ -331,7 +1406,7 @@ EVENT_TERM_PATTERNS = {
     "sales": r"销量|售出|突破|copies|sold|sales",
     "revenue": r"收入|营收|流水|revenue|grossing",
     "download": r"下载|downloads",
-    "launch": r"上线|发布|推出|launch|release",
+    "launch": r"上线|发布|推出|登陆|进入.{0,12}市场|launch|release",
     "price": r"涨价|降价|价格|price",
     "partnership": r"合作|联动|合同|partner|deal|contract",
     "layoff": r"裁员|重组|layoff|restructur",
@@ -380,6 +1455,7 @@ def event_features(title, summary, links, path=""):
         "links": [normalize_url(x) for x in (links if isinstance(links, list) else [links]) if normalize_url(x)],
         "canon_urls": {canonical_url(x) for x in (links if isinstance(links, list) else [links]) if canonical_url(x)},
         "entities": extract_entities(title, text),
+        "products": extract_product_anchors(title, text),
         "money": extract_money_amounts(text),
         "rounds": extract_rounds(text),
         "investors": extract_investors(text),
@@ -406,8 +1482,22 @@ def old_news_match(current, history):
             "reason": "同 canonical URL 已在历史成稿采用",
             "shared": sorted(shared_urls),
         }
+    # 公众号常把同一条新闻隔天转载到不同 URL。它们可能没有融资金额或
+    # 里程碑数字，不能只靠后面的“实体+金额”规则。标题或正文高度相似时
+    # 直接按同事件处理；若确有可核验的新进展，降为软复核而非静默放行。
+    title_overlap = text_similarity(current["title"], history["title"])
+    body_overlap = text_similarity(current["text"], history["text"])
+    if title_overlap >= 0.88 or body_overlap >= 0.82:
+        downgrade = has_new_progress_signal(current["text"], history["text"])
+        return {
+            "level": "soft" if downgrade else "hard",
+            "reason": "跨源标题或正文高度相似，疑似同一新闻转载"
+            + ("；当前文本含实质新进展信号，降为软复核" if downgrade else ""),
+            "shared": [f"标题相似度 {title_overlap:.2f}", f"正文相似度 {body_overlap:.2f}"],
+        }
     shared_entities = current["entities"] & history["entities"]
-    if not shared_entities:
+    shared_products = current.get("products", set()) & history.get("products", set())
+    if not shared_entities and not shared_products:
         return None
     shared_money = current["money"] & history["money"]
     shared_rounds = current["rounds"] & history["rounds"]
@@ -415,6 +1505,18 @@ def old_news_match(current, history):
     shared_numbers = current["numbers"] & history["numbers"]
     shared_terms = current["terms"] & history["terms"]
     downgrade = has_new_progress_signal(current["text"], history["text"])
+
+    # Different sites/accounts often rewrite the title and summary but keep the
+    # exact named product/work.  Exact product anchor + same event type is a
+    # stronger signal than generic company overlap and does not block different
+    # products from the same company.
+    if shared_products and shared_terms:
+        return {
+            "level": "soft" if downgrade else "hard",
+            "reason": "具名产品/作品与事件类型和历史成稿一致"
+            + ("；当前文本含实质新进展信号，降为软复核" if downgrade else ""),
+            "shared": sorted(shared_products | shared_terms),
+        }
 
     # 并购在背景里经常带有融资轮次；优先按并购事件判断，不能被背景融资
     # 信息错误降级为“融资的新进展”。
@@ -504,11 +1606,31 @@ def save_event_audit_state(target_ymd, mode, records, history_sources, skipped_h
         "skipped_soft": skipped_soft,
         "records": records,
     }
-    tmp = out + ".tmp"
+    tmp = out + f".{uuid.uuid4().hex}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
         f.write("\n")
     os.replace(tmp, out)
+def save_editorial_decision_state(target_ymd, profile, window_label, records):
+    """Persist the frozen, time-windowed candidate ledger outside Git."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    out = os.path.join(STATE_DIR, f"资讯日报-筛选审计-{target_ymd}.json")
+    counts = Counter(record.get("decision", "unknown") for record in records)
+    payload = {
+        "date": target_ymd,
+        "profile": profile,
+        "policy_version": EDITORIAL_POLICY_DOCUMENT.get("version"),
+        "window": window_label,
+        "counts": dict(sorted(counts.items())),
+        "records": records,
+    }
+    tmp = out + f".{uuid.uuid4().hex}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp, out)
+    return out
+
 
 
 def seed_undated_seen_from_draft(path, seen):
@@ -583,9 +1705,22 @@ def load_env():
 
 
 def feed_url(src, base):
+    env_name = src.get("url_env")
+    if env_name:
+        configured = os.environ.get(env_name, "").strip()
+        if configured:
+            return configured
     if src.get("route"):
         return base.rstrip("/") + src["route"]
     return src.get("url")
+
+
+def source_enabled(src):
+    """Allow an explicitly named environment flag to enable test-only sources."""
+    env_name = src.get("enabled_env")
+    if env_name:
+        return os.environ.get(env_name, "0").strip() == "1"
+    return bool(src.get("enabled"))
 
 
 def is_wewe_source(src, base=""):
@@ -607,6 +1742,53 @@ def is_wewe_source(src, base=""):
         return parsed.hostname in {"localhost", "127.0.0.1", "::1"} and parsed.port == 4000
     except ValueError:
         return False
+
+
+def is_werss_source(src, base=""):
+    """Return whether a source is the local direct-WeRead enhancement feed.
+
+    WeRSS supplies useful subscribed-public-account context, but it is not an
+    independently reachable public news source.  Its availability therefore
+    cannot satisfy (or fail) the public-source coverage gate.
+    """
+    if src.get("enhancement_source") == "werss":
+        return True
+    name_note = f"{src.get('name', '')} {src.get('note', '')}".lower()
+    if "werss" in name_note or "we-mp-rss" in name_note:
+        return True
+    url = feed_url(src, base) or ""
+    try:
+        parsed = urlsplit(url)
+        return parsed.hostname in {"localhost", "127.0.0.1", "::1"} and parsed.port == 8001
+    except ValueError:
+        return False
+
+
+def is_weread_omni_source(src, base=""):
+    """Return whether a source is the isolated weread-omni evaluation feed."""
+    if src.get("enhancement_source") == "weread_omni":
+        return True
+    name_note = "{} {}".format(src.get("name", ""), src.get("note", "")).lower()
+    return "weread-omni" in name_note or "weread_omni" in name_note
+
+
+def is_optional_enhancement_source(src, base=""):
+    return is_wewe_source(src, base) or is_werss_source(src, base) or is_weread_omni_source(src, base)
+
+
+def requires_verifiable_publish_time(src, base=""):
+    """Private enhancement feeds are usable only with upstream source time."""
+    return is_werss_source(src, base) or is_weread_omni_source(src, base)
+
+
+def should_skip_undated_rss_entry(src, base="", strict_window=False, include_undated=False):
+    """Keep unknown dates out of WeRSS in every run mode.
+
+    Historical/day-target runs already exclude unknown RSS dates by default.
+    The explicit rule here also protects ad-hoc ``--hours`` runs, where
+    ordinary public RSS entries may deliberately remain visible for review.
+    """
+    return requires_verifiable_publish_time(src, base) or (strict_window and not include_undated)
 
 
 BJ_TZ = dt.timezone(dt.timedelta(hours=8))  # 北京时间恒为 UTC+8，无夏令时
@@ -690,6 +1872,14 @@ def sig_tokens(t):
     return toks
 
 
+def text_similarity(left, right):
+    """Conservative 2-gram overlap for syndicated-content detection."""
+    a, b = sig_tokens(left), sig_tokens(right)
+    if min(len(a), len(b)) < 5:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
 def is_dup(sig, seen_sigs, thresh=0.7):
     """近重复：与已收录条目的 2-gram 集合 含入度 ≥ 阈值 即判为重复。"""
     if len(sig) < 4:
@@ -750,6 +1940,42 @@ def hit_keywords(text, include, exclude, protect=()):
     if not include:
         return True
     return any(x.lower() in t for x in include)
+
+
+def editorial_keyword_override(text, profile="legacy"):
+    """Narrow test-profile escape hatch for known high-value false negatives.
+
+    The legacy production profile never uses this override. It only prevents
+    broad feed-level exclusions such as ``机器人`` or ``自动驾驶`` from
+    deleting consumer AI hardware and entertainment world-model stories
+    before the stricter business policy can inspect the complete item.
+    """
+    if not is_test_editorial_profile(profile):
+        return False
+    t = (text or "").lower()
+    consumer_ai_hardware = is_consumer_ai_hardware(t)
+    entertainment_world_model = is_entertainment_world_model(t)
+    return consumer_ai_hardware or entertainment_world_model
+
+
+def keyword_exclusion_hits(text, exclude, protect=()):
+    """Return broad exclusion tokens as evidence, not an automatic test-profile veto."""
+    original = (text or "").lower()
+    scrubbed = original
+    for protected in protect:
+        scrubbed = scrubbed.replace(protected.lower(), "")
+    return sorted({token for token in exclude if token.lower() in scrubbed})
+
+
+def candidate_keyword_match(text, include, exclude, protect=(), profile="legacy"):
+    """Use keywords for recall; the test profile delegates rejection to evidence scoring."""
+    normalized_profile = (profile or "legacy").lower()
+    if not is_test_editorial_profile(normalized_profile):
+        return hit_keywords(text, include, exclude, protect)
+    lowered = (text or "").lower()
+    include_hit = not include or any(token.lower() in lowered for token in include)
+    recall_extra = resolve_editorial_policy(normalized_profile).get("signals", {}).get("recall_extra", [])
+    return include_hit or _v2_any(lowered, recall_extra) or editorial_keyword_override(text, profile)
 
 
 PERSONAL_LIFESTYLE_PATTERNS = [
@@ -842,6 +2068,16 @@ def extract_wechat_nickname(raw):
             nick = clean(m.group(1), 60)
             if nick:
                 return nick
+    return ""
+
+
+def feed_entry_publisher(entry):
+    """Return an RSS entry's explicit publisher/author without channel labels."""
+    for key in ("author", "dc_creator", "creator"):
+        value = entry.get(key, "") if hasattr(entry, "get") else ""
+        publisher = clean(value, 60)
+        if publisher:
+            return publisher
     return ""
 
 
@@ -988,9 +2224,19 @@ FUND_PATTERNS = [
     r"(完成|宣布|获得|获|拿到).{0,24}(融资|投资|募资)",
     r"(融资|募资).{0,24}(完成|宣布|获得|获|领投|跟投|投资方|资金)",
     r"(领投|跟投|本轮融资|本轮股东|投后估值|获投)",
-    r"(天使轮|种子轮|pre-[a-z]|[abcde]\+?轮)",
-    r"(ipo|上市|招股|挂牌|发售|募资)",
+    r"(天使轮|种子轮|pre-[a-z]|[abcde]\s*轮)",
+    r"\bipo\b",
+    r"(提交|递交|申请|启动|计划|拟|准备|寻求).{0,16}(上市|招股|挂牌|公开发售)",
+    r"(赴|登陆|登录).{0,10}(港|美|纳斯达克|纽交所|科创板|创业板|交易所).{0,10}(上市|挂牌)",
+    r"(招股书|招股说明书|上市申请|通过聆讯|上市聆讯)",
     r"(funding round|seed round|series [a-z]|raised|raises|valuation)",
+]
+FUND_NON_EVENT_PATTERNS = [
+    r"(上市价|建议零售价|到手价|售价)",
+    r"(正式上市|新品上市|上市销售|上市发售|上市开售|上市日期)",
+    r"上市公司",
+    r"体验过几轮|测试几轮|轮后",
+    r"xbox\s+series\s+[xs]",
 ]
 ENT_KW = {
     "短剧": "短剧/漫剧", "漫剧": "短剧/漫剧",
@@ -1001,9 +2247,13 @@ ENT_KW = {
 
 
 def is_funding_event(text):
-    """只把明确融资/IPO/上市事件归入全球融资，避免 VC 观点或“新一轮”误入。"""
+    """识别明确融资/IPO动作；产品“上市价/正式上市”不再触发融资。"""
     t = (text or "").lower()
-    return any(re.search(p, t, flags=re.I) for p in FUND_PATTERNS)
+    for pattern in FUND_NON_EVENT_PATTERNS:
+        t = re.sub(pattern, " ", t, flags=re.I)
+    return any(re.search(pattern, t, flags=re.I) for pattern in FUND_PATTERNS) or bool(
+        re.search(r"政府资金|government funding", t, flags=re.I)
+    )
 
 
 def classify(text):
@@ -1024,6 +2274,16 @@ def classify(text):
     if ent_track:
         return "泛娱乐·出海", ent_track
     return "创新·AI娱乐", "AI模型与应用（娱乐向）"
+
+
+def classify_for_editorial_profile(text, profile="legacy"):
+    """Choose a primary track from the multi-label business decision."""
+    if not is_test_editorial_profile(profile):
+        return classify(text)
+    t = (text or "").lower()
+    decision = business_relevance_decision(t, profile)
+    board, track = route_editorial_candidate(t, decision)
+    return (board, track) if board else classify(text)
 
 
 def parse_aibot(url, want):
@@ -1418,6 +2678,11 @@ def main():
                     help="允许在目标日15:00前预抓已发生区间；仅供守门器预抓，正式日报不得使用")
     ap.add_argument("--include-undated", action="store_true",
                     help="把正文页仍取不到时间的列表页条目临时放回候选区；默认仅保留在排查区，避免旧文混入正式候选")
+    ap.add_argument(
+        "--editorial-profile",
+        default=None,
+        help="编辑准入策略；默认读取 RIBAO_EDITORIAL_POLICY 或 sources.yaml。business_v1_test 仅供回归测试。",
+    )
     default_old_news_gate = os.environ.get("RIBAO_OLD_NEWS_GATE", "audit").strip().lower()
     if default_old_news_gate not in {"audit", "hard", "review"}:
         default_old_news_gate = "audit"
@@ -1428,6 +2693,16 @@ def main():
         help="事件级旧闻门禁：audit=只记录不拦截；hard=硬重复不进候选；review=硬重复和软复核均不进候选",
     )
     ap.add_argument("--out", default=None)
+    ap.add_argument("--snapshot-in", default=None,
+                    help="读取已冻结的原始候选快照；测试三版本必须共用同一快照")
+    ap.add_argument("--snapshot-out", default=None,
+                    help="把本次关键词召回后、编辑筛选前的原始候选冻结为 JSON")
+    ap.add_argument("--codex-audit", default=None,
+                    help="仅测试版：读取与冻结快照绑定的共享候选审核叠加结果；缺失/无效即拒绝运行")
+    ap.add_argument("--enrich-shortlist", action="store_true",
+                    help="仅测试：对业务初判非拒绝、但正文过短的公开候选限量补取原文，再冻结为独立快照")
+    ap.add_argument("--enrich-limit", type=int, default=6,
+                    help="--enrich-shortlist 的最多原文请求数（默认 6，避免拖慢日报）")
     ap.add_argument("--print-date", action="store_true",
                     help="只打印默认窗口（最近一个已闭合的北京15:00窗口）对应的 YYYYMMDD 后退出；"
                          "供 wrapper 显式确定目标日期，全链路不再靠最新文件反推")
@@ -1442,6 +2717,54 @@ def main():
         return
 
     cfg = yaml.safe_load(open(SOURCES, encoding="utf-8"))
+    snapshot_payload = None
+    if args.snapshot_in:
+        with open(args.snapshot_in, encoding="utf-8") as handle:
+            snapshot_payload = json.load(handle)
+        if not isinstance(snapshot_payload.get("records"), list):
+            ap.error("--snapshot-in 不是有效的原始候选快照")
+    codex_audit_actions = {}
+    if args.codex_audit:
+        if snapshot_payload is None:
+            ap.error("--codex-audit 必须与 --snapshot-in 一起使用")
+        try:
+            with open(args.codex_audit, encoding="utf-8") as handle:
+                codex_audit_payload = json.load(handle)
+            with open(args.snapshot_in, "rb") as handle:
+                snapshot_sha256 = hashlib.sha256(handle.read()).hexdigest()
+            audit_items = codex_audit_payload.get("items")
+            if (
+                codex_audit_payload.get("schema_version") != 2
+                or codex_audit_payload.get("date") != (args.date or "")
+                or codex_audit_payload.get("snapshot_sha256") != snapshot_sha256
+                or not isinstance(audit_items, list)
+            ):
+                raise ValueError("schema/date/snapshot/items 不匹配")
+            for audit_item in audit_items:
+                link = normalize_url((audit_item or {}).get("url", ""))
+                actions = (audit_item or {}).get("actions")
+                allowed_profiles = {
+                    "business_v2_strict", "business_v2_balanced", "business_v2_recall"
+                }
+                allowed_actions = {"keep", "hold", "remove", "promote"}
+                if (
+                    not link
+                    or not isinstance(actions, dict)
+                    or set(actions) != allowed_profiles
+                    or any(action not in allowed_actions for action in actions.values())
+                ):
+                    raise ValueError("候选审核条目不完整")
+                codex_audit_actions[link] = {
+                    "actions": actions,
+                    "reason": clean((audit_item or {}).get("reason", ""), 240),
+                    "confidence": (audit_item or {}).get("confidence"),
+                }
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            ap.error(f"--codex-audit 不是有效的候选审核结果：{exc}")
+    snapshot_training_counts = {}
+    if snapshot_payload is not None:
+        snapshot_training_counts = snapshot_training_source_counts(snapshot_payload["records"])
+    editorial_profile = editorial_policy_name(cfg.get("config", {}), args.editorial_profile)
     base = os.getenv("RIBAO_RSSHUB_BASE", cfg["config"]["rsshub_base"]).rstrip("/")
     kw = cfg.get("keywords", {})
     include = kw.get("include", [])
@@ -1450,6 +2773,13 @@ def main():
     sel = cfg["config"].get("select", {})
     per_track_top = sel.get("per_track_top", 5)
     total_cap = sel.get("total_cap", 22)
+    quality_gate = quality_gate_for_editorial_profile(cfg["config"], editorial_profile)
+    if is_test_editorial_profile(editorial_profile):
+        complete_body_chars = quality_gate_limit(quality_gate, "min_report_body_chars")
+        partial_body_chars = int(BUSINESS_V1_POLICY["thresholds"]["partial_body_chars"])
+    else:
+        complete_body_chars = 0
+        partial_body_chars = 0
     env = load_env()
 
     start_utc, end_utc, start_bj, end_bj = bj_window(args.hours, args.date)
@@ -1477,13 +2807,70 @@ def main():
     undated_seen = load_undated_seen()
     new_undated_seen = {}
 
-    grouped = defaultdict(lambda: defaultdict(list))   # board -> track -> [items]
+    grouped = defaultdict(lambda: defaultdict(list))   # automatic accept pool
+    review_grouped = defaultdict(lambda: defaultdict(list))  # never auto-selected
+    enabled_public_sources = [
+        src["name"]
+        for src in cfg.get("sources", [])
+        if source_enabled(src)
+        and src.get("type") in PUBLIC_SOURCE_TYPES
+        and not is_optional_enhancement_source(src, base)
+    ]
+    source_candidate_counts = Counter()
+    current_source_name = ""
     wechat_pending, api_pending, errors = [], [], []
     seen_links, seen_sigs = set(), []
+    seen_items_by_key, seen_signature_items = {}, []
+    same_run_merges = 0
     event_audit_records, event_audit_keys = [], set()
     undated = skipped_recent = skipped_undated_seen = skipped_unverified_listpage = 0
     skipped_event_hard = skipped_event_soft = 0
+    skipped_editorial = Counter()
+    skipped_editorial_items = []
+    skipped_keyword_items = []
+    editorial_ledger = []
+    snapshot_keys = set()
+    raw_snapshot_records = []
+    raw_snapshot_keys = set()
     unverified_listpage_items = []
+    enrichment_attempts = 0
+    enrichment_records = []
+
+    def keyword_accepts(text, item):
+        keyword_matched = candidate_keyword_match(text, include, exclude, protect, editorial_profile)
+        # v2 must not lose an otherwise valid article before the central
+        # editorial policy can inspect it.  For explicitly enabled test
+        # profiles, the time-windowed public-source observation is retained
+        # even without a keyword hit; the policy later records accept/review/
+        # reject.  Legacy and v1 keep the original recall behaviour.
+        accepted = keyword_matched or editorial_profile in {
+            "business_v2_strict", "business_v2_balanced", "business_v2_recall"
+        }
+        link = normalize_url(item.get("link", ""))
+        source = item.get("src", current_source_name)
+        key = (source, link, item.get("title", ""))
+        exclusion_hits = keyword_exclusion_hits(text, exclude, protect)
+        if key not in snapshot_keys:
+            snapshot_keys.add(key)
+            editorial_ledger.append({
+                "stage": "keyword_recall",
+                "title": item.get("title", ""),
+                "source": source,
+                "link": link,
+                "decision": "recalled" if accepted else "not_recalled",
+                "recall_mode": "full_public_observation" if accepted and not keyword_matched else "keyword",
+                "keyword_exclusions": exclusion_hits,
+            })
+        if accepted and is_test_editorial_profile(editorial_profile) and exclusion_hits:
+            item["_keyword_exclusion_hits"] = exclusion_hits
+            if len(skipped_keyword_items) < EDITORIAL_AUDIT_MAX_ITEMS:
+                skipped_keyword_items.append({
+                    "title": item.get("title", ""),
+                    "src": source,
+                    "link": link,
+                    "reason": "宽泛排除词已转为复核证据，未删除",
+                })
+        return accepted
 
     def record_event_audit(it, board, track, hit):
         key = (
@@ -1502,19 +2889,204 @@ def main():
         record["gate_mode"] = args.old_news_gate
         event_audit_records.append(record)
 
-    def add(it, board=None, track=None):
-        """统一入口：跨日去重 + 当前运行去重（链接 + 标题近重复）后入库。"""
-        nonlocal undated, skipped_recent, skipped_undated_seen, skipped_event_hard, skipped_event_soft
+    def add(it, board=None, track=None, multi_source_count=0):
+        """Route a candidate through policy, history and same-run clustering."""
+        nonlocal undated, skipped_recent, skipped_undated_seen
+        nonlocal skipped_event_hard, skipped_event_soft, same_run_merges
+        nonlocal enrichment_attempts
         link = normalize_url(it.get("link", ""))
         seen_key = normalize_url(it.get("dedup_key") or link)
         if not link:
             return
-        b, t = (board, track) if board else classify(it["title"] + " " + it.get("summary", ""))
+
+        # RSS summaries can be truncated even when the public article itself
+        # has a complete, relevant body.  Enrichment is a bounded test-only
+        # capture step: it runs before the snapshot is written, records every
+        # result, and is never repeated during the three profile replays.
+        summary_chars = len(re.sub(r"\s+", "", it.get("summary", "")))
+        if (
+            args.enrich_shortlist
+            and is_test_editorial_profile(editorial_profile)
+            and summary_chars < complete_body_chars
+            and enrichment_attempts < max(0, args.enrich_limit)
+            and re.match(r"https?://", link, re.I)
+            and "mp.weixin.qq.com" not in link
+        ):
+            provisional = business_relevance_decision(
+                it.get("title", "") + " " + it.get("summary", ""), editorial_profile,
+                title=it.get("title", ""), summary=it.get("summary", ""),
+                multi_source_corroborated=multi_source_count > 1,
+                multi_source_count=multi_source_count,
+            )
+            if provisional.get("decision") != "reject":
+                enrichment_attempts += 1
+                _page_title, body, images, page_published = fetch_article_details(link)
+                before = summary_chars
+                if len(re.sub(r"\s+", "", body or "")) > before:
+                    it["summary"] = clean(body, 1800)
+                    if images:
+                        it["images"] = images
+                    it["enrichment"] = {
+                        "status": "enriched",
+                        "before_chars": before,
+                        "after_chars": len(re.sub(r"\s+", "", it["summary"])),
+                        "source": "public_article_page",
+                    }
+                    enrichment_records.append({
+                        "title": it.get("title", ""), "link": link,
+                        **it["enrichment"],
+                    })
+                    editorial_ledger.append({
+                        "stage": "candidate_enrichment", "title": it.get("title", ""),
+                        "source": it.get("src", current_source_name), "link": link,
+                        "decision": "enriched", **it["enrichment"],
+                    })
+                else:
+                    enrichment_records.append({
+                        "title": it.get("title", ""), "link": link,
+                        "status": "unavailable", "before_chars": before,
+                        "after_chars": len(re.sub(r"\s+", "", body or "")),
+                        "source": "public_article_page",
+                    })
+
+        # Snapshot is intentionally taken after time/window + keyword recall,
+        # but before editorial policy, history-dedup and profile selection.
+        # This is the shared factual input for strict/balanced/recall replay.
+        if args.snapshot_out:
+            raw_key = (normalize_url(link), it.get("title", ""), it.get("src", current_source_name))
+            if raw_key not in raw_snapshot_keys:
+                raw_snapshot_keys.add(raw_key)
+                raw_item = {k: v for k, v in copy.deepcopy(it).items() if not k.startswith("_")}
+                raw_snapshot_records.append({
+                    "item": raw_item,
+                    "board": board or classify(raw_item.get("title", "") + " " + raw_item.get("summary", ""))[0],
+                    "track": track or classify(raw_item.get("title", "") + " " + raw_item.get("summary", ""))[1],
+                    "source": current_source_name or raw_item.get("src", ""),
+                })
+
+        text_for_editorial = it["title"] + " " + it.get("summary", "")
+        decision = business_relevance_decision(
+            text_for_editorial, editorial_profile,
+            title=it.get("title", ""), summary=it.get("summary", ""),
+            multi_source_corroborated=multi_source_count > 1,
+            multi_source_count=multi_source_count,
+        )
+        audit_entry = codex_audit_actions.get(link) if is_test_editorial_profile(editorial_profile) else None
+        audit_action = (audit_entry or {}).get("actions", {}).get(editorial_profile, "keep")
+        # The shared Codex audit is a validated, test-only editorial overlay.
+        # It never adds facts, but its routing result must be applied
+        # symmetrically: ``remove`` excludes the item, ``hold`` keeps it in the
+        # auditable grey pool, and ``promote`` may elevate only a complete
+        # review item.  Leaving remove/hold advisory while applying promote
+        # produced a candidate set that no longer matched the recorded audit.
+        decision_record = {
+            "stage": "business_relevance",
+            "title": it.get("title", ""),
+            "source": it.get("src", current_source_name),
+            "link": link,
+            **decision,
+            "keyword_exclusions": it.get("_keyword_exclusion_hits", []),
+        }
+        if audit_entry:
+            decision_record.update({
+                "codex_audit_action": audit_action,
+                "codex_audit_reason": audit_entry.get("reason", ""),
+                "codex_audit_confidence": audit_entry.get("confidence"),
+            })
+            if audit_action in {"remove", "hold"} and decision.get("decision") != "reject":
+                editorial_ledger.append({
+                    "stage": "codex_candidate_audit",
+                    "title": it.get("title", ""),
+                    "source": it.get("src", current_source_name),
+                    "link": link,
+                    "decision": f"applied_{audit_action}",
+                    "reason": audit_entry.get("reason", ""),
+                    "profile": editorial_profile,
+                })
+                decision = dict(decision)
+                if audit_action == "remove":
+                    decision.update({
+                        "decision": "reject",
+                        "reason": f"独立候选审核剔除：{audit_entry.get('reason', '与业务目标不匹配')}",
+                        "confidence": audit_entry.get("confidence", decision.get("confidence", 0)),
+                    })
+                else:
+                    decision.update({
+                        "decision": "review",
+                        "reason": f"独立候选审核暂缓：{audit_entry.get('reason', '需人工复核')}",
+                        "confidence": audit_entry.get("confidence", decision.get("confidence", 0)),
+                    })
+                    it["_codex_audit_hold"] = True
+                decision_record.update(decision)
+        editorial_ledger.append(decision_record)
+        if decision["decision"] == "reject":
+            editorial_reason = decision["reason"]
+            skipped_editorial[editorial_reason] += 1
+            if (
+                is_test_editorial_profile(editorial_profile)
+                and len(skipped_editorial_items) < EDITORIAL_AUDIT_MAX_ITEMS
+            ):
+                skipped_editorial_items.append({
+                    "title": it.get("title", ""),
+                    "src": it.get("src", current_source_name),
+                    "link": link,
+                    "reason": editorial_reason,
+                })
+            return
+
+        if is_test_editorial_profile(editorial_profile):
+            b, t = route_editorial_candidate(text_for_editorial, decision, board, track)
+            if not b:
+                b, t = classify_for_editorial_profile(text_for_editorial, editorial_profile)
+        else:
+            b, t = (board, track) if board else classify(text_for_editorial)
+
+        summary_length = len(re.sub(r"\s+", "", it.get("summary", "")))
+        content_status = "complete" if summary_length >= complete_body_chars else (
+            "partial" if summary_length >= partial_body_chars else "title_only"
+        )
+        it["content_status"] = content_status
+        if (
+            audit_action == "promote"
+            and decision.get("decision") == "review"
+            and content_status == "complete"
+        ):
+            decision = dict(decision)
+            decision.update({
+                "decision": "accept",
+                "reason": f"独立候选审核灰区提权：{(audit_entry or {}).get('reason', '相关性与信息完整度通过')}",
+                "confidence": (audit_entry or {}).get("confidence", decision.get("confidence", 0)),
+            })
+            decision_record.update(decision)
+        elif audit_action == "promote":
+            editorial_ledger.append({
+                "stage": "codex_candidate_audit", "title": it.get("title", ""),
+                "source": it.get("src", current_source_name), "link": link,
+                "decision": "ignored_promotion",
+                "reason": "只允许完整正文的灰区条目提权，硬拒绝/正文不足保持原判",
+                "profile": editorial_profile,
+            })
+        if (
+            is_test_editorial_profile(editorial_profile)
+            and decision["decision"] == "accept"
+            and content_status != "complete"
+        ):
+            decision = dict(decision)
+            decision["decision"] = "review"
+            decision["reason"] = f"正文{content_status}，需补全文后复核"
+            decision["confidence"] = 0.60
+            decision_record.update(decision)
+
         old_news_hit = match_event_history(it, event_history) if event_history else None
         if old_news_hit:
             record_event_audit(it, b, t, old_news_hit)
         if link in recent_links:
             skipped_recent += 1
+            editorial_ledger.append({
+                "stage": "history_dedup", "title": it.get("title", ""),
+                "source": it.get("src", current_source_name), "link": link,
+                "decision": "reject", "reason": "前2天链接重复",
+            })
             return
         if old_news_hit and old_news_hit.get("level") == "hard" and args.old_news_gate in {"hard", "review"}:
             skipped_event_hard += 1
@@ -1527,32 +3099,118 @@ def main():
             if first_seen and first_seen != target_ymd:
                 skipped_undated_seen += 1
                 return
+
+        def merge_into(existing):
+            nonlocal same_run_merges
+            if len(it.get("summary", "")) > len(existing.get("summary", "")):
+                existing["summary"] = it.get("summary", "")
+                existing["content_status"] = content_status
+            if it.get("images"):
+                existing["images"] = list(dict.fromkeys(
+                    existing.get("images", []) + it.get("images", [])
+                ))
+            existing.setdefault("_alternate_sources", [])
+            if it.get("src") and it.get("src") != existing.get("src"):
+                existing["_alternate_sources"].append(it.get("src"))
+            existing["_alternate_sources"] = list(dict.fromkeys(existing["_alternate_sources"]))
+            existing.setdefault("_alternate_links", [])
+            if link != existing.get("link"):
+                existing["_alternate_links"].append(link)
+            existing["_alternate_links"] = list(dict.fromkeys(existing["_alternate_links"]))
+            same_run_merges += 1
+            editorial_ledger.append({
+                "stage": "same_run_dedup", "title": it.get("title", ""),
+                "source": it.get("src", current_source_name), "link": link,
+                "decision": "merged", "reason": "同一运行内相同链接或近重复标题",
+                "kept_link": existing.get("link", ""),
+            })
+
         if seen_key in seen_links:
+            existing = seen_items_by_key.get(seen_key)
+            if existing:
+                merge_into(existing)
             return
+
         sig = sig_tokens(it["title"])
-        if is_dup(sig, seen_sigs):
-            return
+        for prior_sig, existing in seen_signature_items:
+            # Links and title signatures are not enough when multiple outlets
+            # describe the same named launch/training event in different words.
+            # Keep one best record and attach the other source as corroboration.
+            if (
+                is_dup(sig, [prior_sig])
+                or (
+                        is_test_editorial_profile(editorial_profile)
+                        and (
+                            same_ai_training_event(it, existing)
+                            or same_run_named_launch_event(it, existing)
+                            or same_run_body_confirmed_model_release(it, existing)
+                            or same_run_major_financial_event(it, existing)
+                        )
+                )
+            ):
+                merge_into(existing)
+                return
+
         seen_links.add(seen_key)
         seen_sigs.append(sig)
-        it["score"] = score(it)
-        grouped[b][t].append(it)
+        seen_items_by_key[seen_key] = it
+        seen_signature_items.append((sig, it))
+        it["_editorial_decision"] = decision
+        it["score"] = score(it) + int(decision.get("score", 0) / 10)
+        if current_source_name:
+            it["_registry_source"] = current_source_name
+
+        if decision["decision"] == "review":
+            review_grouped[b][t].append(it)
+        else:
+            grouped[b][t].append(it)
+            if current_source_name:
+                source_candidate_counts[current_source_name] += 1
+
         if it.get("undated"):
             undated += 1
             if link not in undated_seen:
                 new_undated_seen[link] = target_ymd
 
-    for src in cfg.get("sources", []):
-        if not src.get("enabled"):
+    source_loop = cfg.get("sources", [])
+    if snapshot_payload is not None:
+        source_loop = [{"name": "__frozen_snapshot__", "board": "创新·AI娱乐",
+                        "track": "AI模型与应用（娱乐向）", "type": "snapshot", "enabled": True}]
+        enabled_public_sources = sorted({record.get("source", "") for record in snapshot_payload["records"] if record.get("source")})
+
+    for src in source_loop:
+        if not source_enabled(src):
             continue
         if os.environ.get("RIBAO_EXCLUDE_WEWE", "0") == "1" and is_wewe_source(src, base):
             continue
+        if os.environ.get("RIBAO_EXCLUDE_WERSS", "0") == "1" and is_werss_source(src, base):
+            continue
+        if os.environ.get("RIBAO_EXCLUDE_WEREAD_OMNI", "0") == "1" and is_weread_omni_source(src, base):
+            continue
         board, track, name = src["board"], src["track"], src["name"]
+        current_source_name = name
         typ = src.get("type")
+
+        if typ == "snapshot":
+            for record in snapshot_payload["records"]:
+                item = copy.deepcopy(record.get("item", {}))
+                if not item.get("link"):
+                    continue
+                current_source_name = record.get("source") or item.get("src", "")
+                if not item.get("src"):
+                    item["src"] = current_source_name
+                # The snapshot has already passed the keyword/time stage;
+                # do not re-fetch or re-keyword-filter it in a profile replay.
+                add(
+                    item, record.get("board"), record.get("track"),
+                    snapshot_training_counts.get(normalize_url(item.get("link", "")), 0),
+                )
+            continue
 
         if typ == "aibot":
             try:
                 for it in parse_aibot(src["url"], want_dates):
-                    if hit_keywords(it["title"] + " " + it["summary"], include, exclude, protect):
+                    if keyword_accepts(it["title"] + " " + it["summary"], it):
                         add(it)
             except Exception as ex:
                 errors.append(f"{name}: {ex}")
@@ -1565,7 +3223,7 @@ def main():
                 fetched = 0
                 body_limit = src.get("body_limit", 12)
                 for it in items:
-                    if not hit_keywords(it["title"], include, exclude, protect):
+                    if not keyword_accepts(it["title"], it):
                         continue
                     body, imgs, published = "", [], None
                     # 列表页本身常无时间；进正文页取全文、候选图和发布时间，再做窗口过滤。
@@ -1606,7 +3264,7 @@ def main():
                     if split_items:
                         for child in split_items:
                             text_for_filter = child["title"] + " " + child.get("summary", "")
-                            if not hit_keywords(text_for_filter, include, exclude, protect):
+                            if not keyword_accepts(text_for_filter, child):
                                 continue
                             if is_personal_lifestyle_noise(text_for_filter):
                                 continue
@@ -1654,11 +3312,11 @@ def main():
                             it["images"] = imgs
                         fetched += 1
                     text_for_filter = it["title"] + " " + it.get("summary", "")
-                    if not hit_keywords(text_for_filter, include, exclude, protect):
+                    if not keyword_accepts(text_for_filter, it):
                         continue
                     if is_personal_lifestyle_noise(text_for_filter):
                         continue
-                    if is_low_info_title_only(it["title"], it.get("summary", "")):
+                    if not is_test_editorial_profile(editorial_profile) and is_low_info_title_only(it["title"], it.get("summary", "")):
                         continue
                     if is_commodity_gaming_hardware_launch(text_for_filter):
                         continue
@@ -1702,10 +3360,18 @@ def main():
                 w = in_window(e, start_utc, end_utc)
                 if w is False:             # 明确在窗口外
                     continue
-                if args.date and w is None and not args.include_undated:
+                # The direct WeRead cover endpoint can discover an article
+                # without exposing its real publication time.  Never let a
+                # polling/unknown date enter any WeRSS selection mode.
+                if w is None and should_skip_undated_rss_entry(
+                    src, base, strict_window=bool(args.date), include_undated=args.include_undated
+                ):
                     continue
                 text_for_filter = title + " " + summ
-                if not hit_keywords(text_for_filter, include, exclude, protect):
+                if not keyword_accepts(
+                    text_for_filter,
+                    {"title": title, "src": name, "link": link},
+                ):
                     continue
                 if src.get("fetch_body") and link and body_fetched < body_limit:
                     body, imgs, _published = fetch_article_full(link)
@@ -1721,7 +3387,7 @@ def main():
                 text_for_filter = title + " " + summ
                 if is_personal_lifestyle_noise(text_for_filter):
                     continue
-                if is_low_info_title_only(title, summ):
+                if not is_test_editorial_profile(editorial_profile) and is_low_info_title_only(title, summ):
                     continue
                 if is_commodity_gaming_hardware_launch(text_for_filter):
                     continue
@@ -1732,6 +3398,12 @@ def main():
                     nick = extract_wechat_nickname(raw_entry_html or raw_entry_text)
                     if nick:
                         item_src = f"{nick}（经 WeWe RSS）"
+                elif is_weread_omni_source(src, base):
+                    # weread-omni exposes the real public-account name in the
+                    # RSS author field. Keep the ingestion channel in
+                    # ``_registry_source`` only; reader-facing attribution must
+                    # name the publisher rather than the transport.
+                    item_src = feed_entry_publisher(e) or name
                 split_items = split_baijing_briefs(
                     title,
                     baijing_aggregation_text(raw_entry_text),
@@ -1744,11 +3416,11 @@ def main():
                 if split_items:
                     for child in split_items:
                         child_text = child["title"] + " " + child.get("summary", "")
-                        if not hit_keywords(child_text, include, exclude, protect):
+                        if not keyword_accepts(child_text, child):
                             continue
                         if is_personal_lifestyle_noise(child_text):
                             continue
-                        if is_low_info_title_only(child["title"], child.get("summary", "")):
+                        if not is_test_editorial_profile(editorial_profile) and is_low_info_title_only(child["title"], child.get("summary", "")):
                             continue
                         if is_commodity_gaming_hardware_launch(child_text):
                             continue
@@ -1778,6 +3450,48 @@ def main():
         except Exception as ex:
             errors.append(f"{name}: {ex}")
 
+    # A profile may expand only complete, explicitly high/medium safe-review
+    # candidates.  It never turns a hard reject into a filler item.
+    if is_test_editorial_profile(editorial_profile):
+        for board, tracks in review_grouped.items():
+            for track, items in tracks.items():
+                for item in items:
+                    decision = item.get("_editorial_decision", {})
+                    if not item.get("_codex_audit_hold") and profile_selects_complete_review(
+                        decision, item.get("content_status", "title_only"), editorial_profile
+                    ):
+                        grouped[board][track].append(item)
+                        if item.get("_registry_source"):
+                            source_candidate_counts[item["_registry_source"]] += 1
+                        editorial_ledger.append({
+                            "stage": "profile_review_expansion", "title": item.get("title", ""),
+                            "source": item.get("src", ""), "link": item.get("link", ""),
+                            "decision": "selected_review", "reason": decision.get("reason", ""),
+                            "profile": editorial_profile,
+                        })
+
+    # Test editions share one *daily* ceiling.  Applying a ceiling to every
+    # track separately made a rich day silently publish far beyond 25/30.
+    # Source rotation in select_ranked_track_items prevents one prolific feed
+    # from consuming that shared capacity.
+    v2_selected_ids = None
+    if is_test_editorial_profile(editorial_profile):
+        profile_selection = resolve_editorial_policy(editorial_profile).get("selection", {})
+        # 25 is the publication target for the two expansion editions.  This
+        # is a presentation ceiling, never an eligibility gate: remaining
+        # safe items stay visible as backups for human review.
+        v2_daily_cap = min(total_cap, int(profile_selection.get("max_items", 25)))
+        all_v2_candidates = [
+            item
+            for tracks in grouped.values()
+            for items in tracks.values()
+            for item in items
+        ]
+        v2_selected, _ = select_ranked_track_items(
+            all_v2_candidates, v2_daily_cap, editorial_profile
+        )
+        v2_selected_ids = {id(item) for item in v2_selected}
+
     # ---- 排序 + 精选 + 篇幅控制 ----
     BOARD_ORDER = ["泛娱乐·出海", "创新·AI娱乐", "全球融资"]
     picked, backups, total_pick = [], [], 0
@@ -1787,8 +3501,15 @@ def main():
             continue
         out_lines.append(f"## {board}")
         for track, items in grouped[board].items():
-            items.sort(key=lambda x: x["score"], reverse=True)
-            top, rest = items[:per_track_top], items[per_track_top:]
+            if is_test_editorial_profile(editorial_profile):
+                top = [item for item in items if id(item) in v2_selected_ids]
+                rest = [item for item in items if id(item) not in v2_selected_ids]
+                top.sort(key=lambda item: item["score"], reverse=True)
+                rest.sort(key=lambda item: item["score"], reverse=True)
+            else:
+                items.sort(key=lambda x: x["score"], reverse=True)
+                top, rest = items[:per_track_top], items[per_track_top:]
+            picked.extend(top)
             out_lines.append(f"### {track}（精选 {len(top)} / 候选 {len(items)}）")
             for it in top:
                 total_pick += 1
@@ -1801,12 +3522,51 @@ def main():
                 if it.get("images"):
                     out_lines.append(f"  - 候选图: " + " | ".join(it["images"]))
                 out_lines.append(f"  - {it['link']}")
+                # Show independent corroboration in the draft itself, so the
+                # later writer and QA do not have to guess why a small
+                # training item was exceptionally admitted.
+                if it.get("_alternate_links"):
+                    for alt_source, alt_link in zip(
+                        it.get("_alternate_sources", []), it.get("_alternate_links", [])
+                    ):
+                        out_lines.append(f"  - 同事件独立来源佐证：{alt_source} — {alt_link}")
             for it in rest:
                 flag = " ⏱无时间戳" if it.get("undated") else ""
                 if it.get("published_bj"):
                     flag += f"（发布 {it['published_bj']}）"
                 out_lines.append(f"- 备选：{it['title']}｜{it['src']}{flag} — {it['link']}")
+                # Keep the legacy production draft byte-for-byte compatible.
+                # The richer backup payload is isolated to the explicit test
+                # profile until its generated output has been accepted.
+                if is_test_editorial_profile(editorial_profile):
+                    if it.get("summary"):
+                        out_lines.append(f"  - 摘要：{it['summary']}")
+                    if it.get("images"):
+                        out_lines.append("  - 候选图: " + " | ".join(it["images"]))
             out_lines.append("")
+
+    review_items = []
+    if is_test_editorial_profile(editorial_profile) and review_grouped:
+        out_lines.append("## 业务灰区复核（不自动入选）")
+        out_lines.append("- 仅完整正文且命中本版本可扩展复核层的条目可入候选；其余不自动补数。")
+        for board in BOARD_ORDER + [b for b in review_grouped if b not in BOARD_ORDER]:
+            for track, items in review_grouped.get(board, {}).items():
+                items.sort(key=lambda candidate: candidate["score"], reverse=True)
+                for it in items:
+                    review_items.append(it)
+                    decision = it.get("_editorial_decision", {})
+                    out_lines.append(
+                        f"- 待复核：{it['title']}｜{it['src']}｜{board}/{track}"
+                        f"｜相关度 {decision.get('score', 0)} — {it['link']}"
+                    )
+                    out_lines.append(
+                        f"  - 判断：{decision.get('reason', '')}；"
+                        f"标签：{'、'.join(decision.get('labels', [])) or '无'}；"
+                        f"正文状态：{it.get('content_status', 'unknown')}"
+                    )
+                    if it.get("summary"):
+                        out_lines.append(f"  - 摘要：{it['summary']}")
+        out_lines.append("")
 
     # ---- 抬头 + 组装 ----
     today = target_ymd
@@ -1824,12 +3584,40 @@ def main():
         f"{len(event_history_sources)} 份，命中 {len(event_audit_records)} 条"
         f"（硬拦截 {sum(1 for r in event_audit_records if r.get('level') == 'hard')} / "
         f"软复核 {sum(1 for r in event_audit_records if r.get('level') == 'soft')}）。**",
+        f"**编辑准入：策略 {editorial_profile}；正式候选 {sum(len(items) for tracks in grouped.values() for items in tracks.values())} 条；灰区复核 {len(review_items)} 条；业务不相关剔除 {sum(skipped_editorial.values())} 条。**",
         "",
         "> 下一步：agent 取 ⭐精选 按《格式规范》模板 A/B/C 浓缩成日报；篇幅过长时按 score 优先保留；"
         "融资走模板 C。备选仅作补充池。",
         "",
     ]
     lines = head + out_lines
+    public_failed_names = {
+        error.split(":", 1)[0].strip()
+        for error in errors
+        if error.split(":", 1)[0].strip() in enabled_public_sources
+    }
+    public_selected_count, public_selected_source_count = public_selection_stats(
+        picked, enabled_public_sources
+    )
+    lines.append("## 公开源覆盖")
+    lines.append(
+        f"- 启用自动公开源 {len(enabled_public_sources)} 个；有候选来源 "
+        f"{sum(1 for name in enabled_public_sources if source_candidate_counts.get(name, 0) > 0)} 个；"
+        f"精选覆盖 {public_selected_source_count} 个；抓取失败 {len(public_failed_names)} 个。"
+    )
+    lines.append("")
+    lines.append("|公开源|候选数|状态|")
+    lines.append("|---|---:|---|")
+    for source_name in enabled_public_sources:
+        count = source_candidate_counts.get(source_name, 0)
+        if source_name in public_failed_names:
+            status = "失败"
+        elif count:
+            status = "有候选"
+        else:
+            status = "本窗口无候选"
+        lines.append(f"|{source_name}|{count}|{status}|")
+    lines.append("")
     if wechat_pending:
         lines.append("## ⚠️ 公众号待人工贴链接（无官方API）")
         lines += [f"- [{b}/{t}] {n}（{note}）" if note else f"- [{b}/{t}] {n}"
@@ -1886,6 +3674,20 @@ def main():
         lines.append(f"- 事件级旧闻硬拦截：跳过 {skipped_event_hard} 条")
         lines.append(f"- 事件级旧闻软复核：移出候选 {skipped_event_soft} 条")
         lines.append("")
+    if skipped_editorial:
+        if not (skipped_recent or skipped_undated_seen or skipped_event_hard or skipped_event_soft):
+            lines.append("## 过滤统计")
+        lines.append("- 编辑准入剔除：" + "；".join(f"{reason} {count} 条" for reason, count in sorted(skipped_editorial.items())))
+        lines.append("")
+    if is_test_editorial_profile(editorial_profile) and (skipped_keyword_items or skipped_editorial_items):
+        lines.append("## 测试版筛选审计")
+        lines.append("- 宽泛排除词命中项已转为证据、没有被删除；明确拒绝项未进入候选。")
+        for item in skipped_keyword_items + skipped_editorial_items:
+            link = f" — {item['link']}" if item.get("link") else ""
+            lines.append(
+                f"- {item['reason']}：{item['title']}｜{item.get('src') or '未知来源'}{link}"
+            )
+        lines.append("")
     if skipped_unverified_listpage:
         lines.append("## 列表页无时间戳排查（未进入正式候选）")
         if args.include_undated:
@@ -1921,6 +3723,34 @@ def main():
         skipped_event_soft,
     )
 
+    save_editorial_decision_state(
+        target_ymd,
+        editorial_profile,
+        window_label,
+        editorial_ledger,
+    )
+
+    if args.snapshot_out:
+        snapshot_dir = os.path.dirname(os.path.abspath(args.snapshot_out))
+        if snapshot_dir:
+            os.makedirs(snapshot_dir, exist_ok=True)
+        payload = {
+            "version": 2,
+            "target_ymd": target_ymd,
+            "window": window_label,
+            "capture_profile": editorial_profile,
+            "capture_stage": "after_time_keyword_recall_and_bounded_public_enrichment_before_editorial_policy",
+            "records": raw_snapshot_records,
+            "errors": errors,
+            "enrichment": enrichment_records,
+        }
+        snapshot_tmp = args.snapshot_out + f".{uuid.uuid4().hex}.tmp"
+        with open(snapshot_tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(snapshot_tmp, args.snapshot_out)
+        print(f"   原始候选快照 {len(raw_snapshot_records)} 条：{args.snapshot_out}")
+
     out_dir = os.path.dirname(os.path.abspath(out))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -1933,6 +3763,15 @@ def main():
     print(f"   跨日去重跳过 {skipped_recent} 条 / 历史无时间戳跳过 {skipped_undated_seen} 条")
     print(f"   旧闻复核 {len(event_audit_records)} 条 / 模式 {args.old_news_gate} / "
           f"硬拦截跳过 {skipped_event_hard} 条 / 软复核移出 {skipped_event_soft} 条")
+    gate_failures = coverage_gate_failures(
+        public_selected_count,
+        public_selected_source_count,
+        len(public_failed_names),
+        quality_gate,
+    )
+    if gate_failures:
+        print("❌ 公开源覆盖门禁失败：" + "；".join(gate_failures), file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

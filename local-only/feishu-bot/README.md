@@ -1,6 +1,6 @@
 # Feishu delivery
 
-`send_to_feishu_cli.py` is the active delivery path. It imports the QC-approved Markdown report as Docx with `lark-cli`, records the document before sending, grants the configured group `edit` permission, sends only the document URL and verifies the message by readback.
+`send_to_feishu_cli.py` imports the QC-approved Markdown report as Docx with `lark-cli`. In the current index-only production mode it runs with `--doc-only` and user identity: it does not send IM, but it must grant the configured group `full_access` on the daily Docx. `update_daily_index.py` then updates the pinned index Docx and grants the same group `full_access`. Weaker `view` or `edit` roles are rejected for both documents.
 
 Copy `feishu_bot.env.example` to the gitignored `feishu_bot.env` only if you prefer a separate Feishu env file. The root `config.env` is sufficient for scheduled runs.
 

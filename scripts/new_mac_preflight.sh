@@ -7,6 +7,20 @@ FAILED=0
 
 ok() { printf '[OK] %s\n' "$1"; }
 fail() { printf '[FAIL] %s\n' "$1"; FAILED=1; }
+optional() { printf '[OPTIONAL] %s\n' "$1"; }
+
+if [ -f "$CONFIG_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+  set +a
+fi
+ENABLE_FEISHU="${RIBAO_ENABLE_FEISHU:-0}"
+ENABLE_WEWE="${RIBAO_ENABLE_WEWE:-0}"
+case "$ENABLE_FEISHU:$ENABLE_WEWE" in
+  0:0|0:1|1:0|1:1) ;;
+  *) fail "RIBAO_ENABLE_FEISHU 与 RIBAO_ENABLE_WEWE 必须为 0 或 1" ;;
+esac
 
 if [ "$(uname -s)" = "Darwin" ]; then
   ok "macOS"
@@ -14,13 +28,33 @@ else
   fail "定时守门器需要 macOS launchd"
 fi
 
-for command_name in python3 docker codex lark-cli cloudflared; do
+for command_name in python3 docker codex; do
   if command -v "$command_name" >/dev/null 2>&1; then
     ok "$command_name 已安装"
   else
     fail "$command_name 未安装或不在 PATH"
   fi
 done
+if [ "$ENABLE_FEISHU" = "1" ]; then
+  if ! command -v lark-cli >/dev/null 2>&1; then
+    fail "已启用飞书，但 lark-cli 未安装或不在 PATH"
+  elif lark-cli auth status 2>/dev/null | grep -q 'User identity: ready'; then
+    ok "飞书能力已启用，lark-cli user 身份就绪"
+  else
+    fail "已启用飞书，但 lark-cli user 身份未就绪"
+  fi
+else
+  optional "飞书能力未启用；本地生成与质检不受影响"
+fi
+if [ "$ENABLE_WEWE" = "1" ]; then
+  if command -v cloudflared >/dev/null 2>&1; then
+    ok "WeWe 能力已启用，cloudflared 已安装"
+  else
+    fail "已启用 WeWe，但 cloudflared 未安装或不在 PATH"
+  fi
+else
+  optional "WeWe 能力未启用；守门器会明确排除公众号增强源"
+fi
 
 PYTHON_BIN="${RIBAO_PYTHON_BIN:-python3}"
 if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
@@ -33,23 +67,31 @@ fi
 
 if docker info >/dev/null 2>&1; then
   ok "Docker Desktop 正在运行"
+  if curl -fsS http://127.0.0.1:1200/healthz >/dev/null 2>&1; then
+    ok "本地公开源适配器健康"
+  else
+    fail "本地公开源适配器不可用；运行 docker compose -f public-sources/docker-compose.yml up -d"
+  fi
 else
   fail "Docker daemon 不可用；请启动 Docker Desktop"
 fi
 
 if [ -f "$CONFIG_FILE" ]; then
   ok "config.env 已创建"
-  set -a
-  # shellcheck disable=SC1090
-  . "$CONFIG_FILE"
-  set +a
-  for variable_name in RIBAO_DATA_ROOT RIBAO_PYTHON_BIN WEWE_AUTH_CODE; do
+  for variable_name in RIBAO_DATA_ROOT RIBAO_PYTHON_BIN; do
     if [ -n "${!variable_name:-}" ]; then
       ok "$variable_name 已配置"
     else
       fail "$variable_name 未配置"
     fi
   done
+  if [ "$ENABLE_WEWE" = "1" ] && [ -n "${WEWE_AUTH_CODE:-}" ]; then
+    ok "WEWE_AUTH_CODE 已配置"
+  elif [ "$ENABLE_WEWE" = "1" ]; then
+    fail "已启用 WeWe，但 WEWE_AUTH_CODE 未配置"
+  else
+    optional "WEWE_AUTH_CODE 未要求；WeWe 能力未启用"
+  fi
   if [ -n "${RIBAO_DATA_ROOT:-}" ] && [ -d "$RIBAO_DATA_ROOT" ]; then
     ok "RIBAO_DATA_ROOT 目录存在"
   else
@@ -76,4 +118,4 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
-printf '\n新机预检通过。下一步可启动 WeWe、安装重登服务与日报守门器。\n'
+printf '\n新机预检通过。公开源本地日报可运行；飞书与 WeWe 可选能力按需配置。\n'

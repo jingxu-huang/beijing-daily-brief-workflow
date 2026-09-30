@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter, OrderedDict
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 import sys
@@ -41,6 +43,10 @@ MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class ExternalRuntimeError(RuntimeError):
+    pass
+
+
+class PromptOnlyTimeout(ExternalRuntimeError):
     pass
 
 
@@ -337,7 +343,9 @@ def build_prompt_only_command(
     codex: str,
     control_home: Path,
     model: str,
+    output_schema: Optional[Path] = None,
 ) -> list[str]:
+    schema = output_schema or (control_home / "report-output.schema.json")
     command = [
         codex,
         "exec",
@@ -371,7 +379,7 @@ def build_prompt_only_command(
         "--disable",
         "multi_agent",
         "--output-schema",
-        str(control_home / "report-output.schema.json"),
+        str(schema),
         "--json",
         "-",
     ]
@@ -403,6 +411,66 @@ def last_agent_message(events_text: str) -> str:
     return last
 
 
+def prompt_timeout_seconds() -> int:
+    raw = os.getenv("RIBAO_CODEX_TIMEOUT_SECONDS", str(7 * 60)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ExternalRuntimeError("RIBAO_CODEX_TIMEOUT_SECONDS must be an integer") from exc
+    if not 1 <= value <= 60 * 60:
+        raise ExternalRuntimeError("RIBAO_CODEX_TIMEOUT_SECONDS must be between 1 and 3600")
+    return value
+
+
+def prompt_retry_timeout_seconds() -> int:
+    raw = os.getenv("RIBAO_CODEX_RETRY_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        raw = str(min(120, prompt_timeout_seconds()))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ExternalRuntimeError("RIBAO_CODEX_RETRY_TIMEOUT_SECONDS must be an integer") from exc
+    if not 1 <= value <= prompt_timeout_seconds():
+        raise ExternalRuntimeError(
+            "RIBAO_CODEX_RETRY_TIMEOUT_SECONDS must be positive and no longer than the primary timeout"
+        )
+    return value
+
+
+def run_prompt_process(command, env, prompt, timeout):
+    """Run Codex in its own process group so a timeout cannot leave orphan workers."""
+    process = subprocess.Popen(
+        command,
+        cwd="/",
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(input=prompt, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+        error = PromptOnlyTimeout(f"prompt-only Codex timed out after {timeout}s")
+        error.stdout = stdout
+        error.stderr = stderr
+        raise error from exc
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def run_prompt_only(
     root: Path,
     work: Path,
@@ -410,11 +478,22 @@ def run_prompt_only(
     control_home: Path,
     model: str,
     prompt: str,
+    attempt_label: str = "",
+    timeout_seconds: Optional[int] = None,
+    output_schema: Optional[Path] = None,
 ) -> Path:
     root = validate_root(root)
     work = validate_work_dir(root, work)
     control_home = validate_control_home(control_home)
-    command = build_prompt_only_command(codex, control_home, model)
+    if output_schema is not None:
+        output_schema = require_within(
+            output_schema,
+            root / "资讯日报-skill" / "schemas",
+            "prompt-only output schema",
+        )
+        if not output_schema.is_file():
+            raise ExternalRuntimeError(f"prompt-only output schema is missing: {output_schema}")
+    command = build_prompt_only_command(codex, control_home, model, output_schema)
     env = os.environ.copy()
     env.update(
         {
@@ -428,20 +507,22 @@ def run_prompt_only(
             "XDG_DATA_HOME": str(work / "data"),
         }
     )
+    label = re.sub(r"[^a-z0-9-]", "", attempt_label.lower())
+    events_path = work / (f"codex.{label}.events.jsonl" if label else "codex.events.jsonl")
+    stderr_path = work / (f"codex.{label}.stderr.log" if label else "codex.stderr.log")
+    timeout = timeout_seconds if timeout_seconds is not None else prompt_timeout_seconds()
     try:
-        result = subprocess.run(
-            command,
-            cwd="/",
-            env=env,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=12 * 60,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        atomic_write(work / "codex.stderr.log", f"prompt-only Codex timed out after {exc.timeout}s\n")
-        raise ExternalRuntimeError("prompt-only Codex timed out") from exc
+        result = run_prompt_process(command, env, prompt, timeout)
+    except PromptOnlyTimeout as exc:
+        stdout = getattr(exc, "stdout", "") or ""
+        stderr = getattr(exc, "stderr", "") or ""
+        atomic_write(events_path, stdout)
+        atomic_write(stderr_path, stderr + f"\nprompt-only Codex timed out after {timeout}s\n")
+        atomic_write(work / "codex.events.jsonl", stdout)
+        atomic_write(work / "codex.stderr.log", stderr)
+        raise
+    atomic_write(events_path, result.stdout)
+    atomic_write(stderr_path, result.stderr)
     atomic_write(work / "codex.events.jsonl", result.stdout)
     atomic_write(work / "codex.stderr.log", result.stderr)
     if result.returncode != 0:
@@ -455,6 +536,78 @@ def run_prompt_only(
     return work / "result.json"
 
 
+def configured_report_floor(root: Path) -> int:
+    """Read the report floor from the same sources.yaml quality-gate contract."""
+    import yaml
+
+    config = yaml.safe_load(
+        (root / "资讯日报-skill" / "sources.yaml").read_text(encoding="utf-8")
+    )
+    root_config = (config or {}).get("config", {})
+    profile = os.getenv("RIBAO_EDITORIAL_POLICY", "").strip() or (
+        root_config.get("editorial_policy", {}).get("active_profile", "legacy")
+    )
+    gate = dict(root_config.get("quality_gate", {}))
+    gate.update(
+        root_config.get("editorial_policy", {})
+        .get("profiles", {})
+        .get(profile, {})
+        .get("quality_gate", {})
+    )
+    raw = os.getenv("RIBAO_MIN_REPORT_ITEMS", str(gate.get("min_report_items", 1)))
+    try:
+        floor = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ExternalRuntimeError("min_report_items quality gate must be an integer") from exc
+    return max(1, floor)
+
+
+def test_funding_research_context(data_root: Path, ymd: str, profile: str) -> str:
+    """Return only frozen, test-profile financing research evidence for drafting.
+
+    The writer itself remains offline.  This deliberately separates the
+    interactive Codex/web-research step from the report-writing step, so the
+    latter cannot invent a company profile or silently lose its citations.
+    """
+    if profile not in {"business_v2_strict", "business_v2_balanced", "business_v2_recall"}:
+        return "不适用：正式 legacy 日报不读取测试版融资研究资料。"
+    path = require_within(
+        data_root / "日报状态" / f"测试版-融资企业资料-{ymd}.json",
+        data_root,
+        "test financing research record",
+    )
+    if not path.is_file():
+        return "本次未提供已核验的融资企业资料；不得输出被投方速览或补写公司信息。"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ExternalRuntimeError(f"invalid test financing research record: {exc}") from exc
+    if not isinstance(payload, list):
+        raise ExternalRuntimeError("test financing research record must be a JSON list")
+    if len(payload) > 100:
+        raise ExternalRuntimeError("test financing research record has too many entries")
+    for record in payload:
+        if not isinstance(record, dict):
+            raise ExternalRuntimeError("test financing research record item must be an object")
+        required = {"company", "report_item_url", "researched_at", "business", "business_model", "valuation", "sources_checked"}
+        if not required.issubset(record):
+            raise ExternalRuntimeError("test financing research record is missing traceability fields")
+        if not isinstance(record["sources_checked"], list) or not record["sources_checked"]:
+            raise ExternalRuntimeError("test financing research record has no checked source")
+        business = record["business"]
+        if not isinstance(business, dict) or not {"value", "source_url", "publisher"}.issubset(business):
+            raise ExternalRuntimeError("test financing business record lacks source traceability")
+        for field in ("business_model", "valuation"):
+            value = record[field]
+            if not isinstance(value, dict):
+                raise ExternalRuntimeError(f"test financing {field} record must be an object")
+            if value.get("status") == "not_disclosed":
+                continue
+            if not {"value", "source_url", "publisher"}.issubset(value):
+                raise ExternalRuntimeError(f"test financing {field} record lacks source traceability")
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def build_daily_prompt(root: Path, ymd: str, draft: Path) -> str:
     root = validate_root(root)
     data_root = validate_data_root()
@@ -463,6 +616,7 @@ def build_daily_prompt(root: Path, ymd: str, draft: Path) -> str:
         raise ExternalRuntimeError(f"unexpected daily draft: {draft}")
     skill = root / "资讯日报-skill" / "SKILL.md"
     format_spec = root / "资讯日报-skill" / "format" / "格式规范.md"
+    test_funding_spec = root / "资讯日报-skill" / "format" / "测试版融资补充规范.md"
     reports = []
     report_dir = data_root / "日报文档"
     if report_dir.is_dir():
@@ -473,9 +627,72 @@ def build_daily_prompt(root: Path, ymd: str, draft: Path) -> str:
         )
         for path in candidates[:3]:
             reports.append(f"\n<prior_report name={json.dumps(path.name, ensure_ascii=False)}>\n{path.read_text(encoding='utf-8')}\n</prior_report>")
+    floor = configured_report_floor(root)
+    test_contract = ""
+    active_profile = os.getenv("RIBAO_EDITORIAL_POLICY", "").strip()
+    delivery_contract = build_test_delivery_contract(
+        draft.read_text(encoding="utf-8"), active_profile, floor
+    )
+    funding_research = test_funding_research_context(data_root, ymd, active_profile)
+    if active_profile == "business_v1_test":
+        test_contract = (
+            "\n测试版额外硬约束：备选条目也必须使用草稿所附摘要写出完整事实，"
+            "不得把标题改写成一句话补数；若正式候选与备选仍不足最低条数，可以逐条复核‘业务灰区复核’中正文状态为 complete 的条目，确认业务证据后采用，但不得自动补数，也不得采用 partial/title_only 条目；公众号条目正文末尾必须使用草稿中的真实公众号名称，"
+            "不得写‘微信公众号’等渠道统称；Source 表必须按这些真实名称逐项统计并与正文完全一致。"
+        )
+    elif active_profile in {"business_v2_strict", "business_v2_balanced", "business_v2_recall"}:
+        test_contract = (
+            "\n测试 v2 额外硬约束：备选条目也必须使用草稿所附摘要写出完整事实，"
+            "不得把标题改写成一句话补数；不得使用业务灰区复核、partial/title_only 或拒绝项补数；"
+            "公众号条目正文末尾必须使用草稿中的真实公众号名称，Source 表必须与正文完全一致。"
+        )
+    if active_profile in {"business_v2_balanced", "business_v2_recall"}:
+        test_contract += (
+            "\n本版本最低质量线是 10 条；不得采用硬拒绝项、低价值 AI 信息或明确不相关内容凑数；"
+            "必须主动尝试达到 25 条。达到下限后不得因此停止扩写；只可继续采用草稿中本版本已放行的备选条目。"
+            "涉及产品的条目，正文必须保留该具体功能事实，不得只写标题。"
+        )
+    if delivery_contract:
+        test_contract += f"""
+
+<test_delivery_contract>
+{delivery_contract}
+</test_delivery_contract>
+
+上述交付合同是程序从冻结草稿生成的硬边界：
+1. required_selected_urls 每个 URL 都必须在正文中保留；同一事件可合并为一条，但不得丢失任一条独立来源 URL。
+2. 正文不得出现 allowed_urls 之外的 URL；不得使用灰区、已拒绝条目或模型记忆补数。
+3. 平衡/高召回版应按 backup_urls 顺序尽量达到 publication_target；安全备选耗尽时可低于目标，不可以低质内容凑数。
+4. 测试 v2 不允许写作模型自行 QA_SKIP 已放行精选；候选取舍已在上游完成。
+"""
+    funding_research_contract = ""
+    if active_profile in {"business_v2_strict", "business_v2_balanced", "business_v2_recall"}:
+        funding_research_contract = (
+            "\\n测试版融资条目仅在已提供可审计资料时增加‘被投方速览’；"
+            "速览只写主营/商业模式与最近公开估值，缺失字段必须如实写未披露，"
+            "不得根据模型记忆或草稿外信息自行推断；仅可使用 report_item_url 与本条融资链接一致的记录。"
+            "audit_scope=source_only 时不得超出 evidence_excerpt。补充资料链接只进审计记录，不在正文堆叠。"
+        )
+    if delivery_contract:
+        selection_instruction = (
+            "草稿中每条 ⭐精选的 URL 都必须保留在正文；同一事件可合并成一条，但必须保留所有独立来源 URL。"
+            "不得使用 QA_SKIP 剔除已放行精选。数量不足时只能从 test_delivery_contract.backup_urls 补选，"
+            "不得使用灰区、拒绝项或模型记忆。"
+        )
+    else:
+        selection_instruction = (
+            f"草稿中每条 ⭐精选 都必须进入正文，或在 report_markdown 中用独立的质检注释 "
+            "`<!-- QA_SKIP 原文URL | 简明且可核验的剔除理由 -->` 显式说明。每个被剔除的 URL 单独一条，不得静默遗漏。"
+            "该注释只供质检，质检通过后由受控发布器自动剔除，不会进入最终 Markdown 或飞书文档。"
+            f"如果严格合格的 ⭐精选在合理剔除后会使成稿少于 {floor} 条，只能按草稿现有顺序从“备选”池补到 {floor} 条；"
+            "不得使用排查区、被剔除项或无关资讯补数。"
+        )
     prompt = f"""
 你要生成目标日期 {ymd} 的资讯日报。以下是全部且唯一的输入；不要调用任何工具，不要读写任何文件，不要联网，不要发送飞书。
 严格执行 skill 与格式规范，逐条做主题准入、按正文而非来源归类、合并同一事件，并在输出前完成自检。
+{selection_instruction}
+{test_contract}
+{funding_research_contract}
 最终回复必须严格符合 JSON schema，只包含 report_markdown；值是完整 Markdown 正文，不要用代码围栏包裹。
 
 <skill>
@@ -485,6 +702,14 @@ def build_daily_prompt(root: Path, ymd: str, draft: Path) -> str:
 <format_spec>
 {format_spec.read_text(encoding='utf-8')}
 </format_spec>
+
+<test_funding_spec>
+{test_funding_spec.read_text(encoding='utf-8') if funding_research_contract else '不适用：正式 legacy 日报保持原融资模板。'}
+</test_funding_spec>
+
+<test_funding_research_records>
+{funding_research}
+</test_funding_research_records>
 
 <daily_draft name={json.dumps(draft.name, ensure_ascii=False)}>
 {draft.read_text(encoding='utf-8')}
@@ -499,6 +724,283 @@ def build_daily_prompt(root: Path, ymd: str, draft: Path) -> str:
     return prompt
 
 
+def build_compact_daily_prompt(root: Path, ymd: str, draft: Path) -> str:
+    """Second-attempt prompt: same contract, without historical style payload."""
+    root = validate_root(root)
+    data_root = validate_data_root()
+    draft = require_within(draft, data_root / "日报草稿", "daily draft")
+    format_spec = root / "资讯日报-skill" / "format" / "格式规范.md"
+    test_funding_spec = root / "资讯日报-skill" / "format" / "测试版融资补充规范.md"
+    floor = configured_report_floor(root)
+    test_contract = ""
+    active_profile = os.getenv("RIBAO_EDITORIAL_POLICY", "").strip()
+    if active_profile == "business_v1_test":
+        test_contract = (
+            "测试版额外硬约束：备选必须用草稿摘要写完整事实，不能用标题级一句话补数；正式候选和备选不足时，只能人工判断业务灰区中正文状态 complete 的条目，不得自动使用灰区或 partial/title_only 条目；"
+            "公众号来源必须写真实公众号名，Source 表逐项精确对应，禁止使用‘微信公众号’统称。"
+        )
+    delivery_contract = build_test_delivery_contract(
+        draft.read_text(encoding="utf-8"), active_profile, floor
+    )
+    if delivery_contract:
+        test_contract += (
+            "\n测试 v2 必须严格按下方 test_delivery_contract 交付：保留全部 required_selected_urls，"
+            "正文仅能使用 allowed_urls，不得自行 QA_SKIP；平衡/高召回按安全备选顺序尽量达到目标。"
+            f"\n<test_delivery_contract>\n{delivery_contract}\n</test_delivery_contract>"
+        )
+    funding_research = test_funding_research_context(data_root, ymd, active_profile)
+    funding_research_contract = ""
+    if active_profile in {"business_v2_strict", "business_v2_balanced", "business_v2_recall"}:
+        funding_research_contract = (
+            "测试版融资条目仅在已提供可审计资料时增加‘被投方速览’；只写主营/商业模式与最近公开估值，"
+            "缺失字段如实写未披露，禁止根据模型记忆或草稿外信息推断；仅使用 report_item_url 匹配本条融资链接的资料，"
+            "audit_scope=source_only 时不得超出 evidence_excerpt。"
+        )
+    if delivery_contract:
+        compact_selection = (
+            "每条 ⭐精选 URL 必须在正文保留；同事件合并时保留所有独立来源 URL。"
+            "不得使用 QA_SKIP，不得静默遗漏。数量不足只能按 test_delivery_contract.backup_urls 补选。"
+        )
+    else:
+        compact_selection = (
+            "草稿中每条 ⭐精选 都必须进入正文，或以独立质检注释 "
+            "`<!-- QA_SKIP 原文URL | 简明剔除理由 -->` 逐 URL 显式剔除，不得静默遗漏。"
+            "注释仅供质检，发布前自动剔除。"
+        )
+    return f"""
+生成 {ymd} 资讯日报。禁止调用工具、联网、读写文件或发送飞书。严格输出 schema JSON，且只含 report_markdown。
+固定三大一级板块、二级赛道、标题图标、条目结构和 Source 表，不得改变日报格式。只写输入中的事实，不分析、不补写。
+逐条做业务准入、跨源合并和旧闻排除。优先采用 ⭐精选；若严格合格条目少于 {floor} 条，只能从同一草稿的“备选”池按原顺序补到 {floor} 条，不能用排查区或无关内容补数。
+{compact_selection}
+{test_contract}
+{funding_research_contract}
+
+<format_spec>
+{format_spec.read_text(encoding='utf-8')}
+</format_spec>
+
+<test_funding_spec>
+{test_funding_spec.read_text(encoding='utf-8') if funding_research_contract else '不适用：正式 legacy 日报保持原融资模板。'}
+</test_funding_spec>
+
+<test_funding_research_records>
+{funding_research}
+</test_funding_research_records>
+
+<daily_draft name={json.dumps(draft.name, ensure_ascii=False)}>
+{draft.read_text(encoding='utf-8')}
+</daily_draft>
+""".strip()
+
+
+BOARD_HEADINGS = {
+    "泛娱乐·出海": "# 🌍 泛娱乐·出海",
+    "创新·AI娱乐": "# ✨ 创新·AI娱乐",
+    "全球融资": "# 💸 全球融资",
+}
+TRACK_HEADINGS = {
+    "休闲游戏": "## 🕹️ 休闲游戏",
+    "短剧/漫剧": "## 🎬 短剧/漫剧",
+    "小说·网文": "## 📚 小说·网文",
+    "社交·Dating": "## 💬 社交·Dating",
+    "其他": "## 🌐 其他",
+    "AI模型与应用（娱乐向）": "## 🧠 AI模型与应用（娱乐向）",
+    "创新硬件（娱乐向）": "## 🎧 创新硬件（娱乐向）",
+    "泛娱乐融资": "## 🎭 泛娱乐融资",
+    "泛AI·AI应用融资": "## 🧩 泛AI·AI应用融资",
+}
+
+
+def parse_draft_candidates(text: str) -> list[dict]:
+    """Parse only accepted selected/backup pools; diagnostic sections are ignored."""
+    rows = []
+    board = track = ""
+    current = None
+
+    def finish():
+        nonlocal current
+        if current:
+            rows.append(current)
+            current = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("## ") and line[3:] in BOARD_HEADINGS:
+            finish()
+            board, track = line[3:], ""
+            continue
+        if line.startswith("## ") and line[3:] not in BOARD_HEADINGS:
+            finish()
+            board = track = ""
+            continue
+        if board and line.startswith("### "):
+            finish()
+            track = re.sub(r"（精选.*$", "", line[4:]).strip()
+            continue
+        if not board or track not in TRACK_HEADINGS:
+            continue
+        selected = re.match(r"^- ⭐\*\*(.+?)\*\*(?:（score [^）]+）)?｜(.+)$", line)
+        if selected:
+            finish()
+            source = re.sub(r"\s*⏱.*$|（发布[^）]+）", "", selected.group(2)).strip()
+            current = {
+                "board": board,
+                "track": track,
+                "title": selected.group(1).strip(),
+                "source": source,
+                "summary": "",
+                "link": "",
+                "alternate_links": [],
+                "selected": True,
+            }
+            continue
+        backup = re.match(r"^- 备选：(.+?)｜(.+?)\s+—\s+(https?://\S+)$", line)
+        if backup:
+            finish()
+            source = re.sub(r"\s*⏱.*$|（发布[^）]+）", "", backup.group(2)).strip()
+            current = {
+                "board": board,
+                "track": track,
+                "title": backup.group(1).strip(),
+                "source": source,
+                "summary": "",
+                "link": backup.group(3).strip(),
+                "alternate_links": [],
+                "selected": False,
+            }
+            continue
+        if current and line.startswith("- http"):
+            current["link"] = line[2:].strip()
+        elif current and line.startswith("- 同事件独立来源佐证："):
+            current["alternate_links"].extend(
+                re.findall(r"https?://[^\s|]+", line)
+            )
+        elif current and line.startswith("- ") and not line.startswith("- 候选图:"):
+            summary = line[2:].strip()
+            if summary.startswith("摘要："):
+                summary = summary[3:].strip()
+            current["summary"] = (current.get("summary", "") + " " + summary).strip()
+    finish()
+    return [row for row in rows if row["link"]]
+
+
+def build_test_delivery_contract(draft_text: str, profile: str, floor: int) -> str:
+    """Return a machine-readable v2 candidate boundary for the writer.
+
+    The contract is deliberately absent from legacy and v1 prompts.  It turns
+    the accepted draft from prose guidance into an executable allowlist while
+    keeping the publication target separate from the hard quality floor.
+    """
+    if profile not in {
+        "business_v2_strict", "business_v2_balanced", "business_v2_recall"
+    }:
+        return ""
+    rows = parse_draft_candidates(draft_text)
+    selected = [row for row in rows if row.get("selected")]
+    backups = [row for row in rows if not row.get("selected")]
+
+    def urls(rows_to_read: list[dict]) -> list[str]:
+        output = []
+        for row in rows_to_read:
+            for url in [row.get("link", "")] + list(row.get("alternate_links", []) or []):
+                if url and url not in output:
+                    output.append(url)
+        return output
+
+    required_urls = urls(selected)
+    backup_urls = urls(backups)
+    payload = {
+        "schema_version": 1,
+        "profile": profile,
+        "hard_floor": int(floor),
+        "publication_target": 25 if profile in {
+            "business_v2_balanced", "business_v2_recall"
+        } else int(floor),
+        "required_selected_urls": required_urls,
+        "backup_urls": backup_urls,
+        "allowed_urls": required_urls + [url for url in backup_urls if url not in required_urls],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def render_draft_fallback(root: Path, ymd: str, draft: Path, work: Path) -> Path:
+    """Last-resort fixed-template draft; the normal full QA still decides delivery."""
+    rows = parse_draft_candidates(draft.read_text(encoding="utf-8"))
+    chosen = [row for row in rows if row["selected"]]
+    floor = configured_report_floor(root)
+    if len(chosen) < floor:
+        backups = [row for row in rows if not row["selected"]]
+        chosen.extend(backups[: floor - len(chosen)])
+    if not chosen:
+        raise ExternalRuntimeError("fixed-template fallback found no accepted draft candidates")
+
+    target = datetime.strptime(ymd, "%Y%m%d")
+    prior = target - timedelta(days=1)
+    window = (
+        f"{prior.month}月{prior.day}日15:00 — {target.month}月{target.day}日15:00"
+        "（北京时间，左闭右开）"
+    )
+    grouped = OrderedDict()
+    for row in chosen[:30]:
+        grouped.setdefault((row["board"], row["track"]), []).append(row)
+
+    lines = [f"# 资讯类简报-{target.month}.{target.day}日", "", f"> 时间范围：{window}", ""]
+    sources = Counter()
+    previous_board = ""
+    first_section = True
+    for (board, track), items in grouped.items():
+        if board != previous_board:
+            if not first_section:
+                lines.extend(["<br>", ""])
+            lines.extend([BOARD_HEADINGS[board], ""])
+            previous_board = board
+            first_section = False
+        lines.extend([TRACK_HEADINGS[track], ""])
+        for ordinal, row in enumerate(items, 1):
+            body = re.sub(r"\s+", " ", (row["summary"] or row["title"]).strip())
+            if body and body[-1] not in "。！？.!?":
+                body += "。"
+            annotation = f"（{row['source']}）"
+            if not body.endswith(annotation):
+                body += annotation
+            lines.extend(
+                [
+                    f"### {ordinal}）{row['title']}",
+                    "",
+                    body,
+                    "",
+                    row["link"],
+                ]
+            )
+            # Same-event corroboration is part of the selected delivery
+            # contract.  The deterministic fallback must retain those URLs
+            # just like the model writer; otherwise a fallback silently turns
+            # one multi-source selection into a single-source claim.
+            lines.extend(row.get("alternate_links", []) or [])
+            lines.append("")
+            sources[row["source"]] += 1
+        lines.extend(["<br>", ""])
+    while lines and lines[-1] in {"", "<br>"}:
+        lines.pop()
+    lines.extend(["", "", "---", "", "Source 来源：", "", "|来源|本期采用条数|", "|---|---:|"])
+    lines.extend(f"|{source}|{count}|" for source, count in sources.items())
+    candidate = work / "report.md"
+    atomic_write(candidate, "\n".join(lines).strip() + "\n")
+    return candidate
+
+
+def write_compose_audit(work: Path, mode: str, attempts: list[dict]) -> None:
+    atomic_write(
+        work / "compose-mode.json",
+        json.dumps(
+            {"mode": mode, "attempts": attempts, "same_run": True},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+    )
+
+
 def compose_prompt_only(
     root: Path,
     work: Path,
@@ -508,9 +1010,30 @@ def compose_prompt_only(
     control_home: Path,
     model: str,
 ) -> Path:
-    prompt = build_daily_prompt(root, ymd, draft)
-    run_prompt_only(root, work, codex, control_home, model, prompt)
-    return extract_report(root, work, ymd)
+    attempts = []
+    prompts = (
+        ("full", build_daily_prompt(root, ymd, draft), None),
+        ("compact", build_compact_daily_prompt(root, ymd, draft), prompt_retry_timeout_seconds()),
+    )
+    for label, prompt, timeout in prompts:
+        try:
+            run_prompt_only(
+                root, work, codex, control_home, model, prompt,
+                attempt_label=label, timeout_seconds=timeout,
+            )
+            candidate = extract_report(root, work, ymd)
+            attempts.append({"attempt": label, "status": "ok"})
+            write_compose_audit(work, label, attempts)
+            return candidate
+        except ExternalRuntimeError as exc:
+            attempts.append(
+                {"attempt": label, "status": "failed", "error_category": type(exc).__name__}
+            )
+            (work / "result.json").unlink(missing_ok=True)
+    candidate = render_draft_fallback(root, ymd, draft, work)
+    attempts.append({"attempt": "fixed-template", "status": "ok"})
+    write_compose_audit(work, "fixed-template", attempts)
+    return candidate
 
 
 def repair_prompt_only(
@@ -523,6 +1046,7 @@ def repair_prompt_only(
     codex: str,
     control_home: Path,
     model: str,
+    repair_plan: Optional[Path] = None,
 ) -> Path:
     root = validate_root(root)
     work = validate_work_dir(root, work, ymd)
@@ -530,6 +1054,39 @@ def repair_prompt_only(
     check = require_within(check, work, "repair check")
     if not candidate.is_file() or not check.is_file():
         raise ExternalRuntimeError("repair candidate/check is missing")
+    repair_contract = ""
+    repair_selection_instruction = (
+        "草稿精选不得静默遗漏。应恢复的条目必须恢复正文并满足完整度；"
+        "重复、超窗、明显无关或信息不足的条目，必须以独立的 `<!-- QA_SKIP 原文URL | 简明且可核验的剔除理由 -->` 逐 URL 登记。"
+        "QA_SKIP 是质检用隐藏注释，由质检器写入独立审计状态，质检通过后由受控发布器自动从最终 Markdown/飞书文档剔除。"
+    )
+    if repair_plan is not None:
+        repair_plan = require_within(repair_plan, work, "repair plan")
+        if not repair_plan.is_file():
+            raise ExternalRuntimeError("repair plan is missing")
+        try:
+            plan_payload = json.loads(repair_plan.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ExternalRuntimeError(f"invalid repair plan: {exc}") from exc
+        if plan_payload.get("schema_version") != 2:
+            raise ExternalRuntimeError("unsupported repair plan schema")
+        repair_selection_instruction = (
+            "测试 v2 不得使用 QA_SKIP 改写已冻结的候选取舍。"
+            "missing_required_urls 必须恢复，blocked URL 必须从正文删除，全部 URL 必须位于 allowed_urls。"
+        )
+        repair_contract = f"""
+
+<deterministic_repair_plan>
+{json.dumps(plan_payload, ensure_ascii=False, indent=2)}
+</deterministic_repair_plan>
+
+该计划是由冻结源草稿和统一业务规则生成的可审计指令。必须遵守：
+1. blocked 中的 URL 必须删除；不得以 QA_SKIP 继续绕过已放行精选的交付责任。
+2. missing_required_urls 必须恢复；同事件可合并写作，但该事件的所有必需 URL 都要保留在同一条正文下。
+3. 仅可按 replacements 现有顺序补入，且全部正文 URL 必须属于 allowed_urls；不得从灰区、草稿其他区域或模型记忆自行补数。
+4. 平衡/高召回应向 publication_target 补选；当 safe_pool_exhausted=true 时可低于目标，不得恢复 blocked 项或采用硬拒绝项。
+5. 新增条目只能使用计划中的标题、摘要、来源和 URL 写作，不得补写新事实。
+"""
     base = build_daily_prompt(root, ymd, draft)
     prompt = f"""{base}
 
@@ -540,9 +1097,10 @@ def repair_prompt_only(
 <quality_check>
 {check.read_text(encoding='utf-8')}
 </quality_check>
+{repair_contract}
 
 上一版候选稿未通过独立质检。请修复“必须修复”中的每一项，返回完整的修订后日报，不是差异或解释。
-若草稿的精选条目因主题准入、旧闻或其他规则应被排除，必须按 skill/格式规范在成稿中加入精确 QA_SKIP 声明，不得只是沉默遗漏。
+{repair_selection_instruction}
 继续严格输出只含 report_markdown 的 schema JSON，不调用任何工具。"""
     run_prompt_only(root, work, codex, control_home, model, prompt)
     return extract_report(root, work, ymd)
@@ -550,8 +1108,7 @@ def repair_prompt_only(
 
 def run_quality_check(root: Path, work: Path, draft: Path, candidate: Path) -> tuple[int, str, Path, str]:
     check = work / "check.md"
-    qc = subprocess.run(
-        [
+    command = [
             python_bin(),
             str(root / "资讯日报-skill" / "check_report.py"),
             "--draft",
@@ -560,7 +1117,11 @@ def run_quality_check(root: Path, work: Path, draft: Path, candidate: Path) -> t
             str(candidate),
             "--write",
             str(check),
-        ],
+        ]
+    if os.getenv("RIBAO_TEST_MODE", "0") == "1":
+        command.extend(["--repair-plan", str(work / "repair-plan.json")])
+    qc = subprocess.run(
+        command,
         cwd=root,
         capture_output=True,
         text=True,
@@ -574,6 +1135,23 @@ def run_quality_check(root: Path, work: Path, draft: Path, candidate: Path) -> t
                 verdict = line.split("结论：", 1)[1].strip()
                 break
     return qc.returncode, verdict, check, qc.stderr
+
+
+def repair_plan_requires_action(path: Path) -> bool:
+    """Return whether the deterministic v2 delivery plan still has work.
+
+    WARN is an acceptable editorial verdict, but it is not proof that the
+    selected/backup delivery contract was fulfilled.  This separate signal
+    lets the repair loop continue without turning every advisory warning into
+    a publishing failure.
+    """
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return payload.get("schema_version") == 2 and bool(payload.get("requires_repair"))
 
 
 def prompt_only_probe(
@@ -642,10 +1220,18 @@ def daily_no_send_probe(
         check = work / "check.md"
         for repair_round in range(3):
             qc_exit, verdict, check, qc_stderr = run_quality_check(root, work, draft, candidate)
-            if qc_exit == 0:
+            repair_plan = work / "repair-plan.json"
+            plan_action = (
+                os.getenv("RIBAO_TEST_MODE", "0") == "1"
+                and repair_plan_requires_action(repair_plan)
+            )
+            if qc_exit == 0 and not plan_action:
                 break
             if repair_round >= 2:
-                error = f"quality check exited {qc_exit}: {qc_stderr[-500:]}"
+                if plan_action:
+                    error = "test delivery contract remains unresolved after 3 repair rounds"
+                else:
+                    error = f"quality check exited {qc_exit}: {qc_stderr[-500:]}"
                 break
             candidate = repair_prompt_only(
                 root,
@@ -657,6 +1243,7 @@ def daily_no_send_probe(
                 codex,
                 control_home,
                 model,
+                repair_plan if os.getenv("RIBAO_TEST_MODE", "0") == "1" else None,
             )
     except (ExternalRuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         error = str(exc)
@@ -836,6 +1423,7 @@ def main() -> int:
     repair_parser.add_argument("--draft", required=True)
     repair_parser.add_argument("--candidate", required=True)
     repair_parser.add_argument("--check", required=True)
+    repair_parser.add_argument("--repair-plan", default="")
     repair_parser.add_argument("--codex", required=True)
     repair_parser.add_argument("--control-home", required=True)
     repair_parser.add_argument("--model", required=True)
@@ -890,6 +1478,7 @@ def main() -> int:
                     args.codex,
                     Path(args.control_home),
                     args.model,
+                    Path(args.repair_plan) if args.repair_plan else None,
                 )
             )
         elif args.command == "prompt-probe":

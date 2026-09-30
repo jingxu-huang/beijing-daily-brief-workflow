@@ -9,6 +9,17 @@ import ribao_guard
 
 
 class GuardContractTests(unittest.TestCase):
+    def setUp(self):
+        # Historical WeWe behavior is retained for isolated audit tests only;
+        # production defaults to retired and never runs these probes.
+        patcher = mock.patch.dict(
+            os.environ,
+            {"RIBAO_ENABLE_WEWE": "1", "RIBAO_WEWE_RETIRED": "0"},
+            clear=False,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_fixed_business_times(self):
         self.assertEqual(ribao_guard.CHECK_1, dt.time(11, 0))
         self.assertEqual(ribao_guard.REFRESH_1, dt.time(12, 0))
@@ -207,11 +218,145 @@ class GuardContractTests(unittest.TestCase):
             ribao_guard.Guard.daily_retry_due(daily, now_bj + dt.timedelta(minutes=10))
         )
 
+    def test_retry_reuses_only_coverage_verified_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            state_dir = data_root / "日报状态"
+            draft_dir = data_root / "日报草稿"
+            state_dir.mkdir()
+            draft_dir.mkdir()
+            ymd = "20260912"
+            draft = draft_dir / f"资讯日报-草稿-{ymd}.md"
+            draft.write_text("failed coverage draft\n", encoding="utf-8")
+            manifest = state_dir / f"run-manifest-{ymd}.json"
+
+            manifest.write_text(
+                '{"steps":{"fetch":{"status":"fail"}}}\n', encoding="utf-8"
+            )
+            self.assertFalse(ribao_guard.coverage_verified_draft(data_root, ymd, draft))
+
+            manifest.write_text(
+                '{"steps":{"fetch":{"status":"ok"}}}\n', encoding="utf-8"
+            )
+            self.assertTrue(ribao_guard.coverage_verified_draft(data_root, ymd, draft))
+
+            draft.write_text("", encoding="utf-8")
+            self.assertFalse(ribao_guard.coverage_verified_draft(data_root, ymd, draft))
+
+    def test_generated_manifest_is_adopted_only_with_nonblocking_qa_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "workflow"
+            data_root = Path(tmp) / "data"
+            (root / "资讯日报-skill").mkdir(parents=True)
+            (data_root / "日报状态").mkdir(parents=True)
+            (data_root / "日报文档").mkdir()
+            (data_root / "日报质检").mkdir()
+            (data_root / "日报状态" / "run-manifest-20260901.json").write_text(
+                '{"final":"generated"}\n', encoding="utf-8"
+            )
+            (data_root / "日报文档" / "资讯类简报-9.1日.md").write_text(
+                "report\n", encoding="utf-8"
+            )
+            check = data_root / "日报质检" / "资讯日报-质检-20260901.md"
+            check.write_text("- 结论：WARN\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"RIBAO_DATA_ROOT": str(data_root)}, clear=False):
+                guard = ribao_guard.Guard(root, Path(tmp) / "runtime")
+                self.assertEqual(guard.existing_sent("20260901").get("final"), "generated")
+                check.write_text("- 结论：FAIL\n", encoding="utf-8")
+                self.assertEqual(guard.existing_sent("20260901"), {})
+
+    def test_generated_manifest_without_artifacts_is_not_adopted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "workflow"
+            data_root = Path(tmp) / "data"
+            (root / "资讯日报-skill").mkdir(parents=True)
+            (data_root / "日报状态").mkdir(parents=True)
+            (data_root / "日报状态" / "run-manifest-20260901.json").write_text(
+                '{"final":"generated"}\n', encoding="utf-8"
+            )
+            with mock.patch.dict(os.environ, {"RIBAO_DATA_ROOT": str(data_root)}, clear=False):
+                guard = ribao_guard.Guard(root, Path(tmp) / "runtime")
+                self.assertEqual(guard.existing_sent("20260901"), {})
+
+    def test_adoption_preserves_prior_failure_audit_and_sets_current_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "workflow"
+            data_root = Path(tmp) / "data"
+            (root / "资讯日报-skill").mkdir(parents=True)
+            (data_root / "日报状态").mkdir(parents=True)
+            (data_root / "日报文档").mkdir()
+            (data_root / "日报质检").mkdir()
+            (data_root / "日报状态" / "run-manifest-20260901.json").write_text(
+                '{"final":"generated"}\n', encoding="utf-8"
+            )
+            (data_root / "日报文档" / "资讯类简报-9.1日.md").write_text(
+                "report\n", encoding="utf-8"
+            )
+            (data_root / "日报质检" / "资讯日报-质检-20260901.md").write_text(
+                "- 结论：WARN\n", encoding="utf-8"
+            )
+            state = {
+                "target_ymd": "20260901",
+                "last_now_bj": "2026-09-01T15:18:36+08:00",
+                "stages": {
+                    "daily": {
+                        "status": "fail",
+                        "at_bj": "2026-09-01T15:08:20+08:00",
+                        "exit_code": 1,
+                        "final": "failed",
+                        "next_retry_at_bj": "2026-09-01T15:18:20+08:00",
+                    }
+                },
+            }
+            now_bj = dt.datetime(2026, 9, 1, 15, 18, 36, tzinfo=ribao_guard.BEIJING)
+            with mock.patch.dict(os.environ, {"RIBAO_DATA_ROOT": str(data_root)}, clear=False):
+                guard = ribao_guard.Guard(root, Path(tmp) / "runtime")
+                guard.run_daily(state, now_bj.astimezone(dt.timezone.utc), now_bj)
+            daily = state["stages"]["daily"]
+            self.assertEqual(daily["status"], "sent")
+            self.assertEqual(daily["final"], "generated")
+            self.assertEqual(daily["exit_code"], 0)
+            self.assertEqual(daily["next_retry_at_bj"], "")
+            self.assertEqual(daily["prior_failure"]["final"], "failed")
+            self.assertEqual(daily["prior_failure"]["exit_code"], 1)
+
     def test_guard_uses_external_codex_runtime_without_local_staging(self):
         source = Path(ribao_guard.__file__).read_text(encoding="utf-8")
         self.assertNotIn('"RIBAO_CODEX_STAGING_BASE":', source)
         self.assertIn('"RIBAO_CODEX_WORK_BASE":', source)
         self.assertIn('"RIBAO_CODEX_CONTROL_HOME":', source)
+
+    def test_disabled_wewe_never_probes_or_reminds_and_is_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"RIBAO_ENABLE_WEWE": "0"}, clear=False
+        ):
+            guard = ribao_guard.Guard(Path(tmp), Path(tmp) / "runtime", shadow=False)
+            state = {"target_ymd": "20260821", "last_now_bj": ""}
+            now_bj = dt.datetime(2026, 8, 21, 15, 0, tzinfo=ribao_guard.BEIJING)
+            with mock.patch.object(guard, "probe_wewe") as probe:
+                guard.process_wewe_checks(state, now_bj)
+                frozen = guard.freeze_wewe_at_window_close(state, now_bj)
+            probe.assert_not_called()
+            self.assertEqual(state["stages"]["wewe_disabled"]["status"], "skipped")
+            self.assertEqual(frozen["status"], "disabled")
+            self.assertFalse(frozen["wewe_included"])
+
+    def test_retired_wewe_never_probes_or_reminds_and_is_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {"RIBAO_ENABLE_WEWE": "1", "RIBAO_WEWE_RETIRED": "1"},
+            clear=False,
+        ):
+            guard = ribao_guard.Guard(Path(tmp), Path(tmp) / "runtime", shadow=False)
+            state = {"target_ymd": "20260917", "last_now_bj": ""}
+            now_bj = dt.datetime(2026, 9, 17, 15, 0, tzinfo=ribao_guard.BEIJING)
+            with mock.patch.object(guard, "probe_wewe") as probe:
+                guard.process_wewe_checks(state, now_bj)
+                frozen = guard.freeze_wewe_at_window_close(state, now_bj)
+            probe.assert_not_called()
+            self.assertEqual(state["stages"]["wewe_retired"]["status"], "skipped")
+            self.assertEqual(frozen["status"], "retired")
+            self.assertFalse(frozen["wewe_included"])
 
 
 if __name__ == "__main__":

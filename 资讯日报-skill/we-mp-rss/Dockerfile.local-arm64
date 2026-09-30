@@ -1,0 +1,32 @@
+# Local ARM64 rebuild for macOS/Lima hosts.
+# Upstream v1.5.3 uses ghcr.io/rachelos/base-full:latest, whose published
+# ARM64 variant currently fails before the first shell command. Start from
+# the official Python ARM64 image instead; application source stays at the
+# upstream v1.5.3 tag plus the documented local source fixes.
+FROM --platform=linux/arm64 python:3.12-slim-bookworm
+
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# The WebKit runtime is required by the supported “add by public article URL”
+# flow. Without it, the backend returned a false-success response and no
+# subscription was created.
+ENV INSTALL=True
+ENV HEADLESS=true
+ENV BROWSER_TYPE=webkit
+ENV PLANT_PATH=/app/env
+ENV WEREAD_LIC_PATH=/app/data/wx.lic
+ENV WEREAD_PROFILE_DIR=/app/data/weread-chrome-profile
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/env/driver/_aarch64
+
+WORKDIR /app
+COPY requirements.txt install.sh ./
+RUN apt-get update && apt-get install -y --no-install-recommends bash \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod +x /app/install.sh \
+    && /app/install.sh
+
+COPY . .
+COPY config.example.yaml /app/config.yaml
+RUN chmod +x /app/start.sh
+
+EXPOSE 8001
+CMD ["/app/start.sh"]
