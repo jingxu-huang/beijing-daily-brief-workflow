@@ -2,8 +2,11 @@
 """Persist approved Feishu delivery switches without printing private targets."""
 
 import argparse
+import getpass
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 
@@ -63,11 +66,16 @@ def configure(env_path, chat_id, enable_index, index_only=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", required=True)
-    parser.add_argument("--chat-id", required=True)
+    parser.add_argument("--chat-id", help="战略小组会话 ID；省略时在终端中安全输入")
     parser.add_argument("--enable-index", action="store_true")
     parser.add_argument("--index-only", action="store_true")
     args = parser.parse_args()
-    keys = configure(args.env, args.chat_id, args.enable_index, index_only=args.index_only)
+    chat_id = args.chat_id or os.getenv("FEISHU_REPORT_CHAT_ID")
+    if not chat_id:
+        if not sys.stdin.isatty():
+            parser.error("非交互运行须通过 --chat-id 或 FEISHU_REPORT_CHAT_ID 提供目标；不要写入仓库")
+        chat_id = getpass.getpass("战略小组会话 ID（输入不回显）: ")
+    keys = configure(args.env, chat_id, args.enable_index, index_only=args.index_only)
     print(json.dumps({"ok": True, "configured_keys": keys}, ensure_ascii=False))
 
 

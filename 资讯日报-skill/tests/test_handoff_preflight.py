@@ -52,8 +52,16 @@ class HandoffPreflightTests(unittest.TestCase):
             root = Path(temp)
             bin_dir = root / "bin"
             bin_dir.mkdir()
+            for name in ("docker", "curl"):
+                stub = bin_dir / name
+                stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                stub.chmod(0o755)
             cli = bin_dir / "lark-cli"
-            cli.write_text("#!/bin/sh\necho 'User identity: ready'\n", encoding="utf-8")
+            cli.write_text(
+                "#!/bin/sh\n"
+                "[ \"$1\" = whoami ] && [ \"$2\" = --as ] && [ \"$3\" = user ]\n",
+                encoding="utf-8",
+            )
             cli.chmod(0o755)
             codex = bin_dir / "codex"
             codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -61,6 +69,9 @@ class HandoffPreflightTests(unittest.TestCase):
             codex_home = root / "codex-home"
             codex_home.mkdir()
             (codex_home / "auth.json").write_text("{}\n", encoding="utf-8")
+            skill_dir = root / ".codex" / "skills"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "zixun-ribao").symlink_to(ROOT / "资讯日报-skill")
             data = root / "data"
             formal_state = data / "日报状态"
             test_state = data / "测试版" / "日报状态"
@@ -86,13 +97,23 @@ class HandoffPreflightTests(unittest.TestCase):
                 f'RIBAO_DATA_ROOT="{data}"\nRIBAO_EXISTING_CODEX_HOME="{codex_home}"\n'
                 f'RIBAO_PYTHON_BIN="{sys.executable}"\n'
                 'RIBAO_ENABLE_FEISHU=1\nFEISHU_DOC_ONLY=1\nFEISHU_DAILY_INDEX=1\n'
-                'RIBAO_GROUP_MESSAGES=0\nFEISHU_REPORT_CHAT_ID="example-group"\n',
+                'RIBAO_GROUP_MESSAGES=0\nFEISHU_REPORT_CHAT_ID="example-group"\n'
+                'RIBAO_ALLOW_SYSTEM_DATA_ROOT=1\n',
                 encoding="utf-8",
             )
             result = self._run_check(config, root, bin_dir)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("交接预检通过", result.stdout)
             self.assertFalse((root / "Library" / "LaunchAgents").exists())
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    "RIBAO_ALLOW_SYSTEM_DATA_ROOT=1", "RIBAO_ALLOW_SYSTEM_DATA_ROOT=0"
+                ),
+                encoding="utf-8",
+            )
+            blocked = self._run_check(config, root, bin_dir)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("RIBAO_ALLOW_SYSTEM_DATA_ROOT=1", blocked.stderr)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,19 @@ fi
 [ "${FEISHU_CLI_PERMISSION_AS:-user}" = "user" ] || issue "FEISHU_CLI_PERMISSION_AS 必须为 user。"
 [ -n "${FEISHU_REPORT_CHAT_ID:-}" ] || issue "缺少战略小组 FEISHU_REPORT_CHAT_ID；它用于授权，不用于发群消息。"
 [ -n "${FEISHU_TEST_INDEX_CHAT_ID:-${FEISHU_REPORT_CHAT_ID:-}}" ] || issue "缺少测试索引的战略小组授权目标。"
+SKILL_LINK="${CODEX_HOME:-$HOME/.codex}/skills/zixun-ribao"
+if [ ! -L "$SKILL_LINK" ] || [ "$(readlink "$SKILL_LINK" 2>/dev/null || true)" != "$ROOT_DIR/资讯日报-skill" ]; then
+  issue "Codex Skill 链接没有指向当前仓库；先运行 bootstrap_new_mac.command --prepare-only，勿覆盖其他工作区。"
+fi
+if [ -z "${RIBAO_PYTHON_BIN:-}" ] || [ ! -x "$RIBAO_PYTHON_BIN" ] \
+   || ! "$RIBAO_PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+  issue "RIBAO_PYTHON_BIN 必须指向可运行的 Python 3.10+ 虚拟环境。"
+fi
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  issue "Docker Desktop 未运行；本地公开源适配器无法工作。"
+elif ! curl -fsS "${RIBAO_RSSHUB_BASE:-http://127.0.0.1:1200}/healthz" >/dev/null 2>&1; then
+  issue "本地公开源适配器健康检查失败；先恢复 RSSHub。"
+fi
 [ -f "${RIBAO_EXISTING_CODEX_HOME:-$HOME/.codex}/auth.json" ] || issue "Codex CLI 尚未登录（缺少本机 auth.json）。"
 if ! command -v codex >/dev/null 2>&1; then
   issue "Codex CLI 未安装或不在 PATH。"
@@ -40,12 +53,27 @@ fi
 if ! command -v lark-cli >/dev/null 2>&1; then
   issue "lark-cli 未安装或不在 PATH。"
 else
-  lark_auth_text="$(lark-cli auth status 2>/dev/null || true)"
-  [[ "$lark_auth_text" == *"User identity: ready"* ]] || issue "飞书 lark-cli 的 user 身份未就绪；请由文档所有者完成授权。"
+  lark-cli whoami --as user >/dev/null 2>&1 \
+    || issue "飞书 lark-cli 的 user 身份无法完成只读身份检查；请在安装任务的同一用户会话中授权。"
 fi
 if [ -z "${RIBAO_DATA_ROOT:-}" ] || [ ! -d "$RIBAO_DATA_ROOT" ]; then
   issue "RIBAO_DATA_ROOT 必须指向已存在的独立运行数据目录。"
 else
+  if [ -n "${RIBAO_PYTHON_BIN:-}" ] && [ -x "$RIBAO_PYTHON_BIN" ] \
+     && ! "$RIBAO_PYTHON_BIN" - "$RIBAO_DATA_ROOT" <<'PY' >/dev/null 2>&1
+import os
+import pathlib
+import sys
+
+mount = pathlib.Path(sys.argv[1]).expanduser().resolve(strict=True)
+while mount.parent != mount and not os.path.ismount(mount):
+    mount = mount.parent
+if mount == pathlib.Path("/") and os.getenv("RIBAO_ALLOW_SYSTEM_DATA_ROOT") != "1":
+    raise SystemExit(1)
+PY
+  then
+    issue "运行数据位于系统盘；请改用独立挂载盘，或明确设置 RIBAO_ALLOW_SYSTEM_DATA_ROOT=1。"
+  fi
   TEST_BASE_ROOT="${RIBAO_TEST_DATA_ROOT:-$RIBAO_DATA_ROOT/测试版}"
   if [ "$(cd "$RIBAO_DATA_ROOT" && pwd -P)" = "$(cd "$TEST_BASE_ROOT" 2>/dev/null && pwd -P || printf '%s' "$TEST_BASE_ROOT")" ]; then
     issue "测试版运行目录不能等于正式版 RIBAO_DATA_ROOT。"

@@ -22,9 +22,13 @@ case "$ENABLE_FEISHU:$ENABLE_WEWE" in
   *) echo "RIBAO_ENABLE_FEISHU and RIBAO_ENABLE_WEWE must be 0 or 1." >&2; exit 1 ;;
 esac
 DRY_RUN=0
-if [ "${1:-}" = "--dry-run" ]; then
-  DRY_RUN=1
-fi
+PREPARE_ONLY=0
+case "${1:-}" in
+  "") ;;
+  --dry-run) DRY_RUN=1 ;;
+  --prepare-only) PREPARE_ONLY=1 ;;
+  *) echo "Usage: bash bootstrap_new_mac.command [--dry-run|--prepare-only]" >&2; exit 2 ;;
+esac
 
 say() { printf '\n==> %s\n' "$1"; }
 run() {
@@ -133,8 +137,6 @@ for key, value in values.items():
     text = re.sub(pattern, line, text) if re.search(pattern, text) else text + "\n" + line + "\n"
 if sys.argv[4] and not re.search(r"(?m)^WEWE_AUTH_CODE=.+$", text):
     text = re.sub(r"(?m)^WEWE_AUTH_CODE=.*$", f"WEWE_AUTH_CODE={sys.argv[4]}", text)
-if not re.search(r"(?m)^RIBAO_ALLOW_SYSTEM_DATA_ROOT=", text):
-    text += "\n# User selected local storage for this installation.\nRIBAO_ALLOW_SYSTEM_DATA_ROOT=1\n"
 path.write_text(text, encoding="utf-8")
 PY
   chmod 600 "$CONFIG_FILE"
@@ -147,6 +149,11 @@ run mkdir -p "$CODEX_SKILLS_DIR"
 if [ -e "$SKILL_LINK" ] && [ ! -L "$SKILL_LINK" ]; then
   echo "$SKILL_LINK already exists and is not a symlink; leaving it untouched." >&2
   echo "Move that directory aside, then run this same command again." >&2
+  exit 1
+fi
+if [ -L "$SKILL_LINK" ] && [ "$(readlink "$SKILL_LINK")" != "$ROOT_DIR/资讯日报-skill" ]; then
+  echo "$SKILL_LINK already points to another Skill checkout; leaving it untouched." >&2
+  echo "Review the existing target and switch it deliberately before retrying." >&2
   exit 1
 fi
 run ln -sfn "$ROOT_DIR/资讯日报-skill" "$SKILL_LINK"
@@ -180,6 +187,15 @@ else
   fi
 fi
 
+if [ "$PREPARE_ONLY" -eq 1 ]; then
+  say "准备模式自检（不安装定时任务、不写飞书）"
+  RIBAO_PYTHON_BIN="$ROOT_DIR/.venv/bin/python3" bash "$ROOT_DIR/scripts/verify.sh"
+  printf '\n基础依赖、公开源和 Skill 已准备好；没有安装任何日报调度。\n'
+  printf '下一步：设置独立 RIBAO_DATA_ROOT，私下恢复飞书授权及历史登记，\n'
+  printf '再运行 bash automation/install_parallel.command --check。\n'
+  exit 0
+fi
+
 say "检查必须的人工授权"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "[dry-run] check Codex auth"
@@ -187,12 +203,13 @@ if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] check optional lark-cli identity"
   fi
 else
-  if [ ! -f "$HOME/.codex/auth.json" ]; then
+  if [ ! -f "${RIBAO_EXISTING_CODEX_HOME:-$HOME/.codex}/auth.json" ] \
+     || ! CODEX_HOME="${RIBAO_EXISTING_CODEX_HOME:-$HOME/.codex}" codex login status >/dev/null 2>&1; then
     echo "Codex 尚未登录。请先在 Codex App/CLI 登录，然后重跑本命令。" >&2
     exit 2
   fi
-  if [ "$ENABLE_FEISHU" = "1" ] && ! lark-cli auth status 2>/dev/null | grep -q 'User identity: ready'; then
-    echo "飞书 user 身份尚未就绪；当前索引交付必须以 user 身份导入文档和授权。请完成 lark-cli 登录后重跑。" >&2
+  if [ "$ENABLE_FEISHU" = "1" ] && ! lark-cli whoami --as user >/dev/null 2>&1; then
+    echo "飞书 user 身份无法完成只读身份检查；请在当前用户会话中完成 lark-cli 授权后重跑。" >&2
     exit 2
   fi
 fi

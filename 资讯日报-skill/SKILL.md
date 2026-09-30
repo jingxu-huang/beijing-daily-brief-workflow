@@ -7,7 +7,7 @@ metadata:
 
 # 出海泛娱乐 资讯日报 Skill
 
-新 Mac 恢复或用户要求“一键重启 skill”时，先读 [`../docs/运行与交接手册.md`](../docs/运行与交接手册.md)，从工作流仓库根目录运行 `bash bootstrap_new_mac.command` 完成基础安装、账号授权和公开源，再核对两个固定飞书索引的登记与权限，最后运行 `bash automation/install_parallel.command` 安装正式守门器和测试矩阵。不得把“基础安装完成”冒充“飞书正式/测试双链路已验收”。WeWe RSS、WeRSS、wechat-download-api 当前均不作为在役输入；WeRSS 历史探测代码保留，但未经单独批准不得通过配置重新启用其后台链路。
+新 Mac 恢复或用户要求“一键重启 skill”时，先读 [`../docs/运行与交接手册.md`](../docs/运行与交接手册.md)，从工作流仓库根目录运行 `RIBAO_ENABLE_FEISHU=1 bash bootstrap_new_mac.command --prepare-only` 完成依赖、公开源和 Skill 准备（**不安装调度**）；再配置本人账号、私密恢复原飞书索引及历史登记，运行 `bash automation/install_parallel.command --check`，确认旧机器不会并发生产后才安装正式守门器和测试矩阵。不得把“基础安装完成”冒充“飞书正式/测试双链路已验收”。WeWe RSS、WeRSS、wechat-download-api 当前均不作为在役输入；WeRSS 历史探测代码保留，但未经单独批准不得通过配置重新启用其后台链路。
 
 当任务涉及 Skill 来源、规则演化、公众号渠道替代、历史失败原因或移交复盘时，再读 [`../docs/Skill历史与公众号源迭代.md`](../docs/Skill历史与公众号源迭代.md)。它区分可追溯 Git 提交、Git 外私有测试证据及仅讨论过的方案；历史登录/抓取步骤不是当前执行授权。
 

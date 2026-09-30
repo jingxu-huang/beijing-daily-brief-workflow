@@ -83,6 +83,8 @@ class BootstrapModeTests(unittest.TestCase):
         self.assertIn('RIBAO_ENABLE_FEISHU', script)
         self.assertIn('RIBAO_ENABLE_WEWE', script)
         self.assertIn('open "http://127.0.0.1:4000/dash/accounts"', script)
+        self.assertLess(script.index('if [ "$PREPARE_ONLY" -eq 1 ]'), script.index('say "安装每日日报定时任务"'))
+        self.assertNotIn('text += "\\n# User selected local storage', script)
 
     def test_local_relogin_installer_does_not_require_remote_tunnel(self):
         installer = (REPO_ROOT / "automation/install_wewe_relogin.command").read_text(encoding="utf-8")

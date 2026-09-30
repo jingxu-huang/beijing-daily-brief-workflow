@@ -38,10 +38,10 @@ done
 if [ "$ENABLE_FEISHU" = "1" ]; then
   if ! command -v lark-cli >/dev/null 2>&1; then
     fail "已启用飞书，但 lark-cli 未安装或不在 PATH"
-  elif lark-cli auth status 2>/dev/null | grep -q 'User identity: ready'; then
+  elif lark-cli whoami --as user >/dev/null 2>&1; then
     ok "飞书能力已启用，lark-cli user 身份就绪"
   else
-    fail "已启用飞书，但 lark-cli user 身份未就绪"
+    fail "已启用飞书，但 lark-cli user 身份无法完成只读身份检查"
   fi
 else
   optional "飞书能力未启用；本地生成与质检不受影响"
@@ -67,7 +67,7 @@ fi
 
 if docker info >/dev/null 2>&1; then
   ok "Docker Desktop 正在运行"
-  if curl -fsS http://127.0.0.1:1200/healthz >/dev/null 2>&1; then
+  if curl -fsS "${RIBAO_RSSHUB_BASE:-http://127.0.0.1:1200}/healthz" >/dev/null 2>&1; then
     ok "本地公开源适配器健康"
   else
     fail "本地公开源适配器不可用；运行 docker compose -f public-sources/docker-compose.yml up -d"

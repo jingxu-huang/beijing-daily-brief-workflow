@@ -41,28 +41,31 @@
 - Python 3.10+。
 - 已安装并登录的 Codex CLI。
 - 飞书投递可选：已安装、授权的 `lark-cli`，并能以配置身份导入文档、授权群聊和发送消息。
-- 正式日报不需要 WeWe RSS、Docker 或扫码登录；旧项目保留但不由正式流程调用。
+- 正式日报不需要 WeWe RSS 或扫码登录；当前本地公开源 RSSHub 适配器**需要 Docker Desktop**。
 - 一个专用外接盘/非根挂载目录用于运行数据。源码可放任意位置，运行产物不会回退到系统盘。
 
 ## 快速开始
 
-新 Mac 克隆本仓库后，可用一条命令准备公开源基线、虚拟环境和 Codex skill 链接。默认只安装本地正式守门器；启用飞书时，必须先通过私有状态预检，才会安装正式与测试两条 `launchd` 定时任务。WeWe 已退役，不再由此流程安装或验证：
+新 Mac 克隆本仓库后，先用准备模式安装依赖、启动公开源、建立本机配置和 Skill 链接；**准备模式不安装日报调度**，避免旧、新机器同时自动生产。WeWe 已退役，不再由此流程安装或验证：
 
 ```bash
-bash bootstrap_new_mac.command
+RIBAO_ENABLE_FEISHU=1 bash bootstrap_new_mac.command --prepare-only
 ```
 
-能力模式：
+随后在 `config.env` 中确认独立数据目录，用下列命令在终端中输入战略小组 ID（不回显、不写入 shell 历史），并从旧机器**私密迁移原索引与每日日报登记**：
 
 ```bash
-# 默认：公开源本地生成 + 质检，不写飞书
-bash bootstrap_new_mac.command
-
-# 按需启用；启用后检查账号授权并安装可选依赖（不恢复旧微信扫码服务）
-RIBAO_ENABLE_FEISHU=1 bash bootstrap_new_mac.command
+python3 scripts/configure_feishu_targets.py --env config.env --enable-index --index-only
 ```
 
-脚本会在必须由本人授权或恢复历史登记的环节停下并给出提示；完成后可重复运行同一条命令。安装成功也**不代表当天日报已经生成并写入飞书**；首次实际交付仍须按[运行与交接手册](docs/运行与交接手册.md)验收。
+完成 Codex CLI、飞书 `lark-cli` 的 user 身份授权并恢复历史登记后，先只读预检；确认旧机器已停止相同日期的调度后，才安装：
+
+```bash
+bash automation/install_parallel.command --check
+bash automation/install_parallel.command
+```
+
+缺少授权或私有登记时，`--check` 会列出缺口且不安装任务。旧机器的五份必要登记、索引续接和切换验收步骤见[运行与交接手册](docs/运行与交接手册.md)。直接运行不带 `--prepare-only` 的 bootstrap 属于安装调度操作，不适合仍在交接准备阶段的机器。安装成功也**不代表当天日报已经生成并写入飞书**；首次实际交付仍须验收。
 
 ```bash
 python3 -m pip install -r 资讯日报-skill/requirements.txt
