@@ -84,7 +84,7 @@ PY
   TEST_REPORTS="$TEST_BASE_ROOT/日报状态/feishu-docs.json"
   TEST_RUNS="$TEST_BASE_ROOT/日报状态/feishu-test-runs.json"
   for required in "$FORMAL_INDEX" "$FORMAL_REPORTS" "$TEST_INDEX" "$TEST_REPORTS" "$TEST_RUNS"; do
-    [ -s "$required" ] || issue "缺少历史登记：$required；先私密迁移，勿用空列表覆盖原索引。"
+    [ -s "$required" ] || issue "缺少历史登记：${required}；先私密迁移，勿用空列表覆盖原索引。"
   done
   if [ -s "$FORMAL_INDEX" ] && [ -s "$FORMAL_REPORTS" ] && [ -s "$TEST_INDEX" ] \
      && [ -s "$TEST_REPORTS" ] && [ -s "$TEST_RUNS" ]; then
